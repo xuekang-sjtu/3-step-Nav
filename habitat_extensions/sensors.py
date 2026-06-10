@@ -137,6 +137,9 @@ class VLNOracleProgressSensor(Sensor):
         )
 
 
+        if episode.info is None:
+            episode.info = {}
+
         if "geodesic_distance" not in episode.info.keys():
             distance_from_start = self._sim.geodesic_distance(
                 episode.start_position, episode.goals[0].position
