@@ -235,4 +235,7 @@ def get_config(
     config.freeze()
     return config
 
+_C.LOG_FILE = "log.txt"
+
+
 cfg = _C

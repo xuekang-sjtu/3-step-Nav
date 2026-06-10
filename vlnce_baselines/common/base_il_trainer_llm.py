@@ -1083,7 +1083,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             )
         total = torch.tensor(num_episodes).cuda()
         if self.world_size > 1:
-            dist.reduce(total,dst=0)
+            distr.reduce(total,dst=0)
         total = total.item()
 
         if self.world_size > 1:
