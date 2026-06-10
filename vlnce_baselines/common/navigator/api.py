@@ -47,16 +47,27 @@ class llmClient:
             self.model = model_type
             self.client = OpenAI(
                 api_key="not-needed",  # This value doesn't matter for local deployment
-                base_url="http://192.168.0.15:11434/v1"
+                base_url=os.environ.get("LLAMA_VISION_BASE_URL") or base_url or os.environ.get("OPENAI_BASE_URL")
             )
         elif model_type in ["Qwen/Qwen2-72B", "qwen3-vl:32b", "qwen2.5vl:72b"]:
             self.model = model_type
             self.client = OpenAI(
                 api_key="not-needed",
-                base_url="http://192.168.0.5:11434/v1"
+                base_url=os.environ.get("QWEN_LOCAL_BASE_URL") or base_url or os.environ.get("OPENAI_BASE_URL")
+            )
+        elif "glm" in model_type.lower():
+            self.model = model_type
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url="https://models.sjtu.edu.cn/api/v1"
             )
         else:
-            raise ValueError(f"Unknown model type: {model_type}. Use 'gpt' or 'opensource'.")
+            self.model = model_type
+            effective_base_url = os.environ.get("OPENAI_BASE_URL") or base_url or "https://models.sjtu.edu.cn/api/v1"
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=effective_base_url
+            )
 
         # Token usage accumulator for step-level tracking
         self._step_input_tokens = 0
@@ -100,6 +111,9 @@ class llmClient:
             "messages": messages,
         }
 
+        max_tokens = int(os.environ.get("OPENAI_MAX_TOKENS", "2048"))
+        request_params["max_tokens"] = max_tokens
+
         # Only add temperature for models that support it
         if self.model != "gpt-5-2025-08-07":
             request_params["temperature"] = 0
@@ -108,7 +122,8 @@ class llmClient:
             start_time = time.time()
             chat_response = self._completion_with_backoff(**request_params)
             latency = time.time() - start_time
-            answer = chat_response.choices[0].message.content
+            message = chat_response.choices[0].message
+            answer = message.content if message.content is not None else (getattr(message, "reasoning", None) or "")
 
             # Always accumulate tokens for step-level tracking
             self._accumulate_tokens(chat_response.usage)
@@ -130,7 +145,9 @@ class llmClient:
                 total_usage['latency'] += time.time() - start_time
                 total_usage['input_tokens'] += chat_response.usage.prompt_tokens
                 total_usage['output_tokens'] += chat_response.usage.completion_tokens
-                responses.append(chat_response.choices[0].message.content)
+                msg = chat_response.choices[0].message
+                c = msg.content if msg.content is not None else (getattr(msg, "reasoning", None) or "")
+                responses.append(c)
 
                 # Always accumulate tokens for step-level tracking
                 self._accumulate_tokens(chat_response.usage)
@@ -189,13 +206,17 @@ class llmClient:
             "messages": messages,
         }
 
+        max_tokens = int(os.environ.get("OPENAI_MAX_TOKENS", "2048"))
+        request_params["max_tokens"] = max_tokens
+
         # Only add temperature for models that support it
         if self.model != "gpt-5-2025-08-07":
             request_params["temperature"] = 0
 
         if num_output == 1:
             chat_response = self._completion_with_backoff(**request_params)
-            answer = chat_response.choices[0].message.content
+            message = chat_response.choices[0].message
+            answer = message.content if message.content is not None else (getattr(message, "reasoning", None) or "")
 
             # Always accumulate tokens for step-level tracking
             self._accumulate_tokens(chat_response.usage)
@@ -214,7 +235,9 @@ class llmClient:
                 chat_response = self._completion_with_backoff(**request_params)
                 total_usage['input_tokens'] += chat_response.usage.prompt_tokens
                 total_usage['output_tokens'] += chat_response.usage.completion_tokens
-                responses.append(chat_response.choices[0].message.content)
+                msg = chat_response.choices[0].message
+                c = msg.content if msg.content is not None else (getattr(msg, "reasoning", None) or "")
+                responses.append(c)
 
                 # Always accumulate tokens for step-level tracking
                 self._accumulate_tokens(chat_response.usage)
@@ -239,11 +262,15 @@ class spatialClient:
             self.spatialbot_tokenizer = AutoTokenizer.from_pretrained(
                 self.spatialbot_path,
                 trust_remote_code=True)
-            
-            self.ram_transform = get_transform(image_size=224) 
+
+            self.ram_transform = get_transform(image_size=224)
             self.ram_model = ram(pretrained=self.ram_path, image_size=224, vit='swin_l').eval().to(self.device)
         except Exception as e:
             print(f"Error in loading RAM or SpatialBot: {e}")
+            self.ram_transform = None
+            self.ram_model = None
+            self.spatialbot_model = None
+            self.spatialbot_tokenizer = None
             
     def ram_img_tagging(self, image):
         ram_img = self.ram_transform(image).unsqueeze(0).to(self.device)

@@ -130,6 +130,13 @@ class VLNCEDatasetV1(Dataset):
                 episode.scene_id = os.path.join(scenes_dir, episode.scene_id)
 
             episode.instruction = InstructionData(**episode.instruction)
+            # Compatibility: handle ExtendedInstructionData if instruction_text present
+            instruction_data = dict(episode.instruction)
+            if "instruction_text" in instruction_data:
+                episode.instruction = ExtendedInstructionData(**instruction_data)
+            else:
+                safe_data = {k: v for k, v in instruction_data.items() if k in ("text", "source", "speaker")}
+                episode.instruction = InstructionData(**safe_data)
             if episode.goals is not None:
                 for g_index, goal in enumerate(episode.goals):
                     episode.goals[g_index] = NavigationGoal(**goal)

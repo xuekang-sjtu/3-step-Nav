@@ -234,3 +234,5 @@ def get_config(
 
     config.freeze()
     return config
+
+cfg = _C
