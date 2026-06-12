@@ -8,10 +8,11 @@ import os
 
 # Resolve project root for shared model/data paths (cross-platform)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
+MODELS_ROOT = os.path.join(PROJECT_ROOT, "models")
 # Add recognize_anything code to path
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "models", "recognize_anything_code"))
-# Add SpatialBot3B to path
-sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.join(MODELS_ROOT, "recognize_anything_code"))
+# Add the parent directory of SpatialBot3B so `import SpatialBot3B...` works
+sys.path.insert(0, MODELS_ROOT)
 
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
@@ -29,9 +30,9 @@ transformers.logging.set_verbosity_error()
 transformers.logging.disable_progress_bar()
 warnings.filterwarnings('ignore')
 
-from recognize_anything.ram.models import ram
-from recognize_anything.ram import inference_ram
-from recognize_anything.ram import get_transform
+from ram.models import ram
+from ram import inference_ram
+from ram import get_transform
 
 import base64
 import io
@@ -259,13 +260,45 @@ class spatialClient:
         self.device = device
         self.ram_path = os.path.join(PROJECT_ROOT, "models", "recognize_anything", "pretrained", "ram_swin_large_14m.pth")
         self.spatialbot_path = os.path.join(PROJECT_ROOT, "models", "SpatialBot3B")
+        self.spatialbot_device = "cuda" if torch.cuda.is_available() else "cpu"
         view_record_path = "cache_files/view_cache.json"
         try:
-            self.spatialbot_model = AutoModelForCausalLM.from_pretrained(
-                self.spatialbot_path,
-                torch_dtype=torch.float16, # float32 for cpu
-                device_map='auto',
-                trust_remote_code=True)
+            from transformers import BitsAndBytesConfig
+            from transformers.modeling_utils import PreTrainedModel
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            original_to = PreTrainedModel.to
+
+            def safe_quantized_to(model, *args, **kwargs):
+                return model
+
+            PreTrainedModel.to = safe_quantized_to
+            try:
+                self.spatialbot_model = AutoModelForCausalLM.from_pretrained(
+                    self.spatialbot_path,
+                    quantization_config=bnb_config,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True)
+            finally:
+                PreTrainedModel.to = original_to
+            model_device = getattr(self.spatialbot_model, "device", None)
+            if model_device is not None:
+                self.spatialbot_device = str(model_device)
+        except ImportError:
+            raise RuntimeError(
+                "3-step-Nav requires bitsandbytes for 4bit quantized SpatialBot3B loading on limited VRAM. "
+                "Install with: pip install bitsandbytes"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "3-step-Nav requires local SpatialBot3B and RAM dependencies for faithful visual perception."
+            ) from e
+
+        try:
             self.spatialbot_tokenizer = AutoTokenizer.from_pretrained(
                 self.spatialbot_path,
                 trust_remote_code=True)
@@ -273,11 +306,9 @@ class spatialClient:
             self.ram_transform = get_transform(image_size=224)
             self.ram_model = ram(pretrained=self.ram_path, image_size=224, vit='swin_l').eval().to(self.device)
         except Exception as e:
-            print(f"Error in loading RAM or SpatialBot: {e}")
-            self.ram_transform = None
-            self.ram_model = None
-            self.spatialbot_model = None
-            self.spatialbot_tokenizer = None
+            raise RuntimeError(
+                "3-step-Nav requires local SpatialBot3B and RAM dependencies for faithful visual perception."
+            ) from e
             
     def ram_img_tagging(self, image):
         ram_img = self.ram_transform(image).unsqueeze(0).to(self.device)

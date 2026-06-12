@@ -2,7 +2,7 @@ BASE_TASK_CONFIG_PATH: habitat_extensions/config/vlnce_task_rxr.yaml
 SIMULATOR_GPU_IDS: [0]
 TORCH_GPU_ID: 0
 TORCH_GPU_IDS: [0]
-TRAINER_NAME: schedulesampler-RXR_3STEP
+TRAINER_NAME: schedulesampler-OPENNAV
 GPU_NUMBERS: 1
 NUM_ENVIRONMENTS: 1
 CHECKPOINT_FOLDER: logs/checkpoints/
@@ -23,7 +23,7 @@ MODEL:
   DEPTH_ENCODER:
     encode_size: 128
     output_size: 256
-    ddppo_checkpoint: data/pretrained_models/ddppo-models/gibson-2plus-resnet50.pth
+    ddppo_checkpoint: ../datasets/ddppo-models/gibson-2plus-resnet50.pth
   VISUAL_DIM:
     vis_hidden: 512
     directional: 64
