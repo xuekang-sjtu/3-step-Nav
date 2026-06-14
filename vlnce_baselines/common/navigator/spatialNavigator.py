@@ -156,7 +156,7 @@ class Open_Nav():
                 next_vp, observe_description = random.choice(list(observe_dict.items()))
                 logger.warning(f"Random choice a next predicted action {next_vp}")
                 gpt_interaction['metadata']['random_fallback'] = True
-                return next_vp, observe_description, gpt_interaction
+                return next_vp, "Random fallback (no valid LLM prediction)", "Unknown", gpt_interaction
 
         logger.info(decision_reasoning)
 

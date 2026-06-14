@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shared'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+SHARED_ROOT = os.path.join(PROJECT_ROOT, "shared")
+if SHARED_ROOT not in sys.path:
+    sys.path.insert(0, SHARED_ROOT)
 import torch
 import random
 import argparse
@@ -11,6 +16,7 @@ import habitat_extensions  # noqa: F401
 import vlnce_baselines     # noqa: F401
 from vlnce_baselines.config.default import get_config
 from habitat_baselines.common.baseline_registry import baseline_registry
+from resume_utils import collect_completed_episode_ids, filter_remaining_episode_ids
 
 def main():
     parser = argparse.ArgumentParser()
@@ -59,6 +65,15 @@ def main():
         choices=["r2r-100", "r2r-all", "rxr-100", "rxr-all"],
         help="Only run cross-floor episodes",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from already completed episodes in the current experiment directory.",
+    )
+    parser.add_argument("--ssa-guidance", action="store_true", help="Enable SSA stair takeover.")
+    parser.add_argument("--ssa-checkpoint", type=str, default="SemanticSpatialAlignmentModule/outputs/20260604_121042/best_model.pt")
+    parser.add_argument("--ssa-detect-threshold", type=float, default=0.50)
+    parser.add_argument("--ssa-detector-model-source", type=str, default="")
 
     args = parser.parse_args()
 
@@ -78,7 +93,10 @@ def main():
 def run_exp(exp_name: str, exp_config: str,
             opts=None, local_rank=None,
             llm: str = None, api_key: str = None,
-            episodes_to_load: int = None, cross_floor_filter: str = None) -> None:
+            episodes_to_load: int = None, cross_floor_filter: str = None,
+            resume: bool = False, ssa_guidance: bool = False,
+            ssa_checkpoint: str = "", ssa_detect_threshold: float = 0.50,
+            ssa_detector_model_source: str = "") -> None:
     r"""Runs experiment given mode and config
     """
     config = get_config(exp_config, opts)
@@ -97,6 +115,11 @@ def run_exp(exp_name: str, exp_config: str,
         config.LLM = llm
     if api_key is not None:
         config.API_KEY = api_key
+    config.RESUME = bool(resume)
+    config.SSA_GUIDANCE = bool(ssa_guidance)
+    config.SSA_CHECKPOINT = str(ssa_checkpoint)
+    config.SSA_DETECT_THRESHOLD = float(ssa_detect_threshold)
+    config.SSA_DETECTOR_MODEL_SOURCE = str(ssa_detector_model_source)
 
     if episodes_to_load is not None:
         config.TASK_CONFIG.DATASET.EPISODES_TO_LOAD = episodes_to_load
@@ -106,6 +129,29 @@ def run_exp(exp_name: str, exp_config: str,
         allowed = get_cross_floor_episode_ids(cross_floor_filter)
         config.TASK_CONFIG.DATASET.EPISODES_ALLOWED = allowed
         print(f"Cross-floor filter [{cross_floor_filter}]: {len(allowed)} episodes")
+
+    if resume:
+        completed_ids = collect_completed_episode_ids(config.RESULTS_DIR)
+        if completed_ids:
+            current_allowed = config.TASK_CONFIG.DATASET.EPISODES_ALLOWED
+            if current_allowed is None:
+                from gzip import open as gzip_open
+                with gzip_open(
+                    config.TASK_CONFIG.TASK.NDTW.GT_PATH.format(split=config.TASK_CONFIG.DATASET.SPLIT)
+                ) as f:
+                    gt_data = __import__("json").load(f)
+                current_allowed = list(gt_data.keys())
+            remaining = filter_remaining_episode_ids(current_allowed, completed_ids)
+            before = len(current_allowed)
+            config.TASK_CONFIG.DATASET.EPISODES_ALLOWED = remaining
+            print(
+                f"Resume filter: {before} -> {len(remaining)} episodes "
+                f"(skipped {before - len(remaining)} completed from {config.RESULTS_DIR})"
+            )
+            if not remaining:
+                print("Resume filter found no remaining episodes. Nothing to run.")
+                config.freeze()
+                return
 
     config.freeze()
     

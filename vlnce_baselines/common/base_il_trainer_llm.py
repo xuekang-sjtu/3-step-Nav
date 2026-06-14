@@ -4,9 +4,12 @@ import jsonlines
 import os
 import time
 import warnings
+from pathlib import Path
 
 # Resolve project root for shared model paths (cross-platform)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 from collections import defaultdict
 from typing import Dict, List
 from PIL import Image
@@ -63,6 +66,11 @@ from ..utils import get_camera_orientations
 from ..models.utils import (
     length2mask, dir_angle_feature, dir_angle_feature_with_ele,
 )
+from shared.ssa import SSAController, ask_ssa_delegate, build_ssa_plan, execute_ssa_takeover
+
+
+def _ssa_front_view(images_dict):
+    return images_dict.get("0")
 
 def image_to_base64(image_array):
     """Convert numpy image array to base64 string"""
@@ -385,13 +393,15 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 config.EVAL.EPISODE_COUNT, sum(envs.number_of_episodes)
             )
 
+        resume_enabled = bool(getattr(config, "RESUME", False))
+
         # ========== Resume from checkpoint: Load completed episodes ==========
         completed_episode_ids = set()
         episode_results_file = os.path.join(
             config.RESULTS_DIR,
             f"episode_results_{config.TASK_CONFIG.DATASET.SPLIT}_r{self.local_rank}_w{self.world_size}.json"
         )
-        if os.path.exists(episode_results_file):
+        if resume_enabled and os.path.exists(episode_results_file):
             try:
                 with open(episode_results_file, "r") as f:
                     existing_results = json.load(f)
@@ -439,6 +449,13 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             actions_cache = {}
         
         navigator = Open_Nav(self.device,config.LLM, config.API_KEY)
+        ssa_controller = SSAController(
+            enabled=getattr(config, "SSA_GUIDANCE", False),
+            workspace_root=Path(PROJECT_ROOT),
+            checkpoint_path=getattr(config, "SSA_CHECKPOINT", ""),
+            detect_threshold=float(getattr(config, "SSA_DETECT_THRESHOLD", 0.5)),
+            detector_model_source=getattr(config, "SSA_DETECTOR_MODEL_SOURCE", None),
+        )
         current_step = 0
         current_action_idx = 0
         nav_history = []
@@ -463,7 +480,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         global_total_steps = 0
 
         # ========== Resume: Load existing global statistics ==========
-        if len(completed_episode_ids) > 0:
+        if resume_enabled and len(completed_episode_ids) > 0:
             running_stats_file = os.path.join(
                 config.RESULTS_DIR,
                 f"stats_ckpt_{config.TASK_CONFIG.DATASET.SPLIT}_running.json"
@@ -499,7 +516,10 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
             # ========== Resume: Skip already completed episodes ==========
             current_ep_id = current_episodes[0].episode_id
-            if current_ep_id in completed_episode_ids or str(current_ep_id) in completed_episode_ids:
+            if resume_enabled and (
+                current_ep_id in completed_episode_ids
+                or str(current_ep_id) in completed_episode_ids
+            ):
                 print(f"[Resume] Skipping already completed episode {current_ep_id}")
                 # Mark as done and reset to next episode
                 stats_episodes[current_ep_id] = None  # Placeholder to track skipped episodes
@@ -524,6 +544,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 episode_step_latencies = []
                 episode_step_input_tokens = []
                 episode_step_output_tokens = []
+                ssa_controller.reset()
 
                 # Add initial image for next episode
                 if '0' in images_list:
@@ -649,6 +670,10 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             if len(nav_history) == 0:
                 history_traj = "Step 0 start position. "
 
+            front_view = _ssa_front_view(images_dict)
+            ssa_takeover_requested = False
+            ssa_plan_result = None
+
             if not stop_flag:                               
                 nav_logger.info("========== Next Action Prediction ==========")
                 if current_action_idx + 1 < len(action_list):
@@ -666,6 +691,40 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     filtered_images_dict = images_dict
                 else:
                     nav_logger.info(f"Filtered out {len(stuck_directions)} stuck directions: {stuck_directions}")
+
+                if front_view is not None:
+                    ssa_proposal = ssa_controller.update_proposal(
+                        instruction=instruction,
+                        previous_output=history_traj,
+                        previous_plan=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
+                        rgb=np.asarray(front_view["rgb"]),
+                        depth=np.asarray(front_view["depth"]),
+                    )
+                else:
+                    ssa_proposal = {"available": False}
+                step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
+                step_data["ssa_delegated"] = False
+
+                if ssa_proposal.get("available", False):
+                    should_delegate = ask_ssa_delegate(
+                        infer_fn=lambda system_prompt, user_prompt: navigator.llm.gpt_infer_with_images(
+                            system_prompt,
+                            user_prompt,
+                            images={"0": front_view},
+                        ),
+                        instruction=instruction,
+                        current_stage=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
+                        history=history_traj,
+                        observation_hint=observe_dict.get("0", ""),
+                    )
+                    if should_delegate:
+                        ssa_plan_result = build_ssa_plan(envs, 0, ssa_proposal["estimate"])
+                        if ssa_plan_result.get("error") or not ssa_plan_result.get("actions"):
+                            nav_logger.info(f"[SSA] plan rejected | reason={ssa_plan_result.get('error', 'ssa_plan_empty')}")
+                            ssa_controller.used_this_episode = True
+                        else:
+                            ssa_takeover_requested = True
+                            step_data["ssa_delegated"] = True
 
                 next_vp, thought, completion_estimation, gpt_interaction = navigator.move_to_next_vp_single(nav_logger, action_list[current_action_idx], landmark_list[current_action_idx], history_traj, observation, filtered_observe_dict, filtered_images_dict, next_instruction)
 
@@ -851,6 +910,29 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
             try:
                 if not stop_flag:
+                    if ssa_takeover_requested and ssa_plan_result is not None:
+                        takeover = execute_ssa_takeover(envs, env_index=0, plan_result=ssa_plan_result)
+                        nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
+
+                        step_latency = time.time() - step_start_time
+                        step_tokens = navigator.llm.get_step_tokens()
+                        episode_step_latencies.append(step_latency)
+                        episode_step_input_tokens.append(step_tokens['input_tokens'])
+                        episode_step_output_tokens.append(step_tokens['output_tokens'])
+
+                        observations = takeover.observations
+                        dones = takeover.dones
+                        infos = takeover.infos
+                        instruction, images_list = self.generate_input(observations[-1])
+                        observations = extract_instruction_tokens(
+                            observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID
+                        )
+                        batch = batch_obs(observations, self.device)
+                        batch = apply_obs_transforms_batch(batch, obs_transforms)
+
+                        if not dones[0]:
+                            continue
+
                     env_actions = []
                     env_actions.append({'action':
                         {'action': 4,
@@ -948,6 +1030,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     previous_position = None  # Reset position tracking for new episode
                     stuck_directions = set()  # Reset stuck directions for new episode
                     last_chosen_vp = None  # Reset last chosen viewpoint for new episode
+                    ssa_controller.reset()
 
                     # Add initial image for new episode
                     if '0' in images_list:
@@ -1079,10 +1162,14 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         if self.world_size > 1:
             distr.barrier()
         aggregated_stats = {}
-        num_episodes = len(stats_episodes)
-        for stat_key in next(iter(stats_episodes.values())).keys():
+        valid_stats = [value for value in stats_episodes.values() if value is not None]
+        num_episodes = len(valid_stats)
+        if num_episodes == 0:
+            logger.info("No newly evaluated episodes with metrics were produced in this run.")
+            return
+        for stat_key in valid_stats[0].keys():
             aggregated_stats[stat_key] = (
-                sum(v[stat_key] for v in stats_episodes.values())
+                sum(v[stat_key] for v in valid_stats)
                 / num_episodes
             )
         total = torch.tensor(num_episodes).cuda()
@@ -1367,4 +1454,3 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             
         self.traj = self.collect_val_traj()
         self._eval_llm()
-
