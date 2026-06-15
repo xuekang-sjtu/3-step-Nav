@@ -17,6 +17,7 @@ import vlnce_baselines     # noqa: F401
 from vlnce_baselines.config.default import get_config
 from habitat_baselines.common.baseline_registry import baseline_registry
 from resume_utils import collect_completed_episode_ids, filter_remaining_episode_ids
+from episode_filter import filter_episode_ids, parse_episode_ids
 
 def main():
     parser = argparse.ArgumentParser()
@@ -70,9 +71,15 @@ def main():
         action="store_true",
         help="Resume from already completed episodes in the current experiment directory.",
     )
+    parser.add_argument(
+        "--episode-id",
+        type=str,
+        default=None,
+        help="Comma-separated episode ids to evaluate, e.g. 1413,1370,1371.",
+    )
     parser.add_argument("--ssa-guidance", action="store_true", help="Enable SSA stair takeover.")
     parser.add_argument("--ssa-checkpoint", type=str, default="SemanticSpatialAlignmentModule/outputs/20260604_121042/best_model.pt")
-    parser.add_argument("--ssa-detect-threshold", type=float, default=0.50)
+    parser.add_argument("--ssa-detect-threshold", type=float, default=0.30)
     parser.add_argument("--ssa-detector-model-source", type=str, default="")
 
     args = parser.parse_args()
@@ -82,7 +89,7 @@ def main():
     if args.opts:
         i = 0
         while i < len(args.opts):
-            if args.opts[i] in ("--episodes_to_load", "--cross-floor-filter"):
+            if args.opts[i] in ("--episodes_to_load", "--cross-floor-filter", "--episode-id"):
                 i += 2
             else:
                 filtered_opts.append(args.opts[i])
@@ -95,8 +102,8 @@ def run_exp(exp_name: str, exp_config: str,
             llm: str = None, api_key: str = None,
             episodes_to_load: int = None, cross_floor_filter: str = None,
             resume: bool = False, ssa_guidance: bool = False,
-            ssa_checkpoint: str = "", ssa_detect_threshold: float = 0.50,
-            ssa_detector_model_source: str = "") -> None:
+            ssa_checkpoint: str = "", ssa_detect_threshold: float = 0.30,
+            ssa_detector_model_source: str = "", episode_id: str = None) -> None:
     r"""Runs experiment given mode and config
     """
     config = get_config(exp_config, opts)
@@ -129,6 +136,24 @@ def run_exp(exp_name: str, exp_config: str,
         allowed = get_cross_floor_episode_ids(cross_floor_filter)
         config.TASK_CONFIG.DATASET.EPISODES_ALLOWED = allowed
         print(f"Cross-floor filter [{cross_floor_filter}]: {len(allowed)} episodes")
+
+    requested_episode_ids = parse_episode_ids(episode_id)
+    if requested_episode_ids:
+        current_allowed = config.TASK_CONFIG.DATASET.EPISODES_ALLOWED
+        if current_allowed is None:
+            from gzip import open as gzip_open
+            with gzip_open(
+                config.TASK_CONFIG.TASK.NDTW.GT_PATH.format(split=config.TASK_CONFIG.DATASET.SPLIT)
+            ) as f:
+                gt_data = __import__("json").load(f)
+            current_allowed = list(gt_data.keys())
+        before = len(current_allowed)
+        allowed = filter_episode_ids(current_allowed, requested_episode_ids)
+        config.TASK_CONFIG.DATASET.EPISODES_ALLOWED = allowed
+        print(
+            f"Episode-id filter [{','.join(requested_episode_ids)}]: "
+            f"{before} -> {len(allowed)} episodes"
+        )
 
     if resume:
         completed_ids = collect_completed_episode_ids(config.RESULTS_DIR)

@@ -5,6 +5,7 @@ import os
 import time
 import warnings
 from pathlib import Path
+import imageio
 
 # Resolve project root for shared model paths (cross-platform)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
@@ -72,6 +73,59 @@ from shared.ssa import SSAController, ask_ssa_delegate, build_ssa_plan, execute_
 def _ssa_front_view(images_dict):
     return images_dict.get("0")
 
+
+def _ssa_view_yaw_deg(angle_value):
+    angle_deg = float(np.rad2deg(angle_value))
+    return ((angle_deg + 180.0) % 360.0) - 180.0
+
+
+def _ssa_stair_subtask_active(current_action, current_landmarks):
+    stair_keywords = ("stair", "stairs", "step", "steps", "staircase", "upstairs", "downstairs")
+    text_parts = [str(current_action or "")]
+    if isinstance(current_landmarks, list):
+        text_parts.extend(str(item or "") for item in current_landmarks)
+    elif current_landmarks:
+        text_parts.append(str(current_landmarks))
+    text = " ".join(text_parts).lower()
+    return any(keyword in text for keyword in stair_keywords)
+
+
+def _new_ssa_episode_trace():
+    return {
+        "proposal_seen": False,
+        "delegated": False,
+        "takeover_success": False,
+        "takeover_reason": "",
+        "available_steps": [],
+        "rejection_reasons": [],
+        "proposal_estimates": [],
+        "delegate_declined_steps": [],
+    }
+
+
+def _resolve_valid_viewpoint(
+    predicted_vp,
+    candidate_dict,
+    logger,
+    *,
+    context: str,
+):
+    predicted_key = str(predicted_vp)
+    if predicted_key in candidate_dict:
+        return predicted_key
+
+    candidate_keys = list(candidate_dict.keys())
+    if not candidate_keys:
+        raise KeyError(f"No candidate viewpoints available during {context}.")
+
+    fallback_key = "0" if "0" in candidate_dict else candidate_keys[0]
+    logger.warning(
+        f"Invalid predicted viewpoint '{predicted_key}' during {context}. "
+        f"Falling back to valid candidate '{fallback_key}'. "
+        f"Available candidates: {candidate_keys}"
+    )
+    return fallback_key
+
 def image_to_base64(image_array):
     """Convert numpy image array to base64 string"""
     if isinstance(image_array, np.ndarray):
@@ -91,6 +145,25 @@ def image_to_base64(image_array):
         pil_image.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
         return f"data:image/jpeg;base64,{img_str}"
+    return None
+
+
+def _save_episode_rgb_gif(gif_dir, episode_id, frames, nav_logger):
+    if not frames:
+        return
+    os.makedirs(gif_dir, exist_ok=True)
+    output_path = os.path.join(gif_dir, f"{episode_id}.gif")
+    imageio.mimsave(output_path, frames, duration=0.8)
+    nav_logger.info(f"Saved RGB GIF for episode {episode_id} to {output_path}")
+
+
+def _extract_low_level_rgb(observation):
+    rgb = observation.get("rgb")
+    if rgb is None:
+        return None
+    frame = np.asarray(rgb)
+    if frame.ndim == 3 and frame.shape[-1] >= 3:
+        return frame[..., :3].astype(np.uint8).copy()
     return None
 
 with warnings.catch_warnings():
@@ -382,9 +455,10 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         ) 
 
         stats_episodes = {}
-        rgb_frames = [[] for _ in range(envs.num_envs)]
-        if len(config.VIDEO_OPTION) > 0:
-            os.makedirs(config.VIDEO_DIR, exist_ok=True)
+        high_rgb_gif_dir = os.path.join(config.RESULTS_DIR, "rgb_gifs_high")
+        low_rgb_gif_dir = os.path.join(config.RESULTS_DIR, "rgb_gifs_low")
+        os.makedirs(high_rgb_gif_dir, exist_ok=True)
+        os.makedirs(low_rgb_gif_dir, exist_ok=True)
 
         if config.EVAL.EPISODE_COUNT == -1:
             episodes_to_eval = sum(envs.number_of_episodes)
@@ -461,6 +535,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         nav_history = []
         error_number = 0
         chosen_images = []
+        low_level_rgb_frames = []
         chosen_images_descriptions = []  # Descriptions for each image
         env_actions_history = []  # Record environment actions for backtracking
         previous_position = None  # Track previous position to detect if stuck
@@ -510,6 +585,11 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             chosen_images.append(images_list['0']['rgb'].copy())
             chosen_images_descriptions.append("Initial position: Agent standing at start point looking forward")
             nav_logger.info("Added initial forward-looking image to sequence")
+        initial_low_rgb = _extract_low_level_rgb(observations[-1])
+        if initial_low_rgb is not None:
+            low_level_rgb_frames.append(initial_low_rgb)
+
+        episode_ssa_trace = _new_ssa_episode_trace()
         
         while envs.num_envs > 0 and len(stats_episodes) < episodes_to_eval:
             current_episodes = envs.current_episodes()
@@ -536,6 +616,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 current_action_idx = 0
                 nav_history = []
                 chosen_images = []
+                low_level_rgb_frames = []
                 chosen_images_descriptions = []
                 env_actions_history = []
                 previous_position = None
@@ -545,11 +626,15 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 episode_step_input_tokens = []
                 episode_step_output_tokens = []
                 ssa_controller.reset()
+                episode_ssa_trace = _new_ssa_episode_trace()
 
                 # Add initial image for next episode
                 if '0' in images_list:
                     chosen_images.append(images_list['0']['rgb'].copy())
                     chosen_images_descriptions.append("Initial position: Agent standing at start point looking forward")
+                reset_low_rgb = _extract_low_level_rgb(observations[0])
+                if reset_low_rgb is not None:
+                    low_level_rgb_frames.append(reset_low_rgb)
                 continue
 
             positions = []; headings = []
@@ -576,6 +661,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     "steps": []  # Will store step-by-step data
                 }
                 debug_info["episodes"].append(episode_info)
+                episode_ssa_trace = _new_ssa_episode_trace()
             # Otherwise, use the last episode entry (which should be the current one)
             else:
                 episode_info = debug_info["episodes"][-1] if debug_info["episodes"] else None
@@ -588,6 +674,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         "steps": []
                     }
                     debug_info["episodes"].append(episode_info)
+                    episode_ssa_trace = _new_ssa_episode_trace()
             actions, landmark_list = "", []
             if instruction not in actions_cache.keys():
                 actions = navigator.get_actions(instruction)
@@ -670,7 +757,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             if len(nav_history) == 0:
                 history_traj = "Step 0 start position. "
 
-            front_view = _ssa_front_view(images_dict)
+            current_action = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
+            current_landmarks = landmark_list[current_action_idx] if current_action_idx < len(landmark_list) else []
+            ssa_subtask_active = _ssa_stair_subtask_active(current_action, current_landmarks)
             ssa_takeover_requested = False
             ssa_plan_result = None
 
@@ -692,41 +781,13 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 else:
                     nav_logger.info(f"Filtered out {len(stuck_directions)} stuck directions: {stuck_directions}")
 
-                if front_view is not None:
-                    ssa_proposal = ssa_controller.update_proposal(
-                        instruction=instruction,
-                        previous_output=history_traj,
-                        previous_plan=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
-                        rgb=np.asarray(front_view["rgb"]),
-                        depth=np.asarray(front_view["depth"]),
-                    )
-                else:
-                    ssa_proposal = {"available": False}
-                step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
-                step_data["ssa_delegated"] = False
-
-                if ssa_proposal.get("available", False):
-                    should_delegate = ask_ssa_delegate(
-                        infer_fn=lambda system_prompt, user_prompt: navigator.llm.gpt_infer_with_images(
-                            system_prompt,
-                            user_prompt,
-                            images={"0": front_view},
-                        ),
-                        instruction=instruction,
-                        current_stage=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
-                        history=history_traj,
-                        observation_hint=observe_dict.get("0", ""),
-                    )
-                    if should_delegate:
-                        ssa_plan_result = build_ssa_plan(envs, 0, ssa_proposal["estimate"])
-                        if ssa_plan_result.get("error") or not ssa_plan_result.get("actions"):
-                            nav_logger.info(f"[SSA] plan rejected | reason={ssa_plan_result.get('error', 'ssa_plan_empty')}")
-                            ssa_controller.used_this_episode = True
-                        else:
-                            ssa_takeover_requested = True
-                            step_data["ssa_delegated"] = True
-
                 next_vp, thought, completion_estimation, gpt_interaction = navigator.move_to_next_vp_single(nav_logger, action_list[current_action_idx], landmark_list[current_action_idx], history_traj, observation, filtered_observe_dict, filtered_images_dict, next_instruction)
+                next_vp = _resolve_valid_viewpoint(
+                    next_vp,
+                    filtered_observe_dict,
+                    nav_logger,
+                    context="3-step viewpoint selection",
+                )
 
                 # Track the chosen viewpoint
                 last_chosen_vp = next_vp
@@ -737,17 +798,110 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 if next_vp in step_data["viewpoints"]:
                     step_data["viewpoints"][next_vp]["is_chosen"] = True
 
+                step_data["ssa_subtask_active"] = bool(ssa_subtask_active)
+                step_data["ssa_viewpoint"] = next_vp
+                step_data["ssa_view_yaw_deg"] = (
+                    _ssa_view_yaw_deg(radius_dict[next_vp]) if next_vp in radius_dict else 0.0
+                )
+                selected_ssa_view = filtered_images_dict.get(next_vp)
+                if not ssa_subtask_active:
+                    ssa_proposal = {
+                        "available": False,
+                        "reason": "not_stair_subtask",
+                    }
+                elif selected_ssa_view is None:
+                    ssa_proposal = {
+                        "available": False,
+                        "reason": "missing_selected_view",
+                    }
+                else:
+                    ssa_proposal = ssa_controller.update_proposal(
+                        instruction=current_action,
+                        previous_output="",
+                        previous_plan=" ".join(str(item) for item in current_landmarks if item),
+                        rgb=np.asarray(selected_ssa_view["rgb"]),
+                        depth=np.asarray(selected_ssa_view["depth"]),
+                        view_yaw_deg=step_data["ssa_view_yaw_deg"],
+                    )
+                step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
+                step_data["ssa_delegated"] = False
+                step_data["ssa_reason"] = str(ssa_proposal.get("reason", ""))
+                ssa_estimate = SSAController._compact_estimate(ssa_proposal.get("estimate"))
+                if ssa_estimate:
+                    step_data["ssa_estimate"] = ssa_estimate
+                    episode_ssa_trace["proposal_estimates"].append(
+                        {
+                            "step": current_step,
+                            "available": step_data["ssa_available"],
+                            "reason": step_data["ssa_reason"],
+                            "viewpoint": step_data["ssa_viewpoint"],
+                            "view_yaw_deg": step_data["ssa_view_yaw_deg"],
+                            "estimate": ssa_estimate,
+                        }
+                    )
+                nav_logger.info(
+                    f"[SSA] step={current_step} episode={episode_id} "
+                    f"subtask_active={step_data['ssa_subtask_active']} "
+                    f"viewpoint={step_data['ssa_viewpoint']} "
+                    f"view_yaw_deg={step_data['ssa_view_yaw_deg']:.1f} "
+                    f"available={step_data['ssa_available']} reason={step_data['ssa_reason']}"
+                )
+
+                if step_data["ssa_available"]:
+                    episode_ssa_trace["proposal_seen"] = True
+                    episode_ssa_trace["available_steps"].append(current_step)
+                elif step_data["ssa_reason"]:
+                    episode_ssa_trace["rejection_reasons"].append(
+                        {
+                            "step": current_step,
+                            "reason": step_data["ssa_reason"],
+                        }
+                    )
+
+                if ssa_proposal.get("available", False):
+                    should_delegate = ask_ssa_delegate(
+                        infer_fn=lambda system_prompt, user_prompt: navigator.llm.gpt_infer_with_images(
+                            system_prompt,
+                            user_prompt,
+                            images={"0": selected_ssa_view},
+                        ),
+                        instruction=instruction,
+                        current_stage=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
+                        history=history_traj,
+                        observation_hint=filtered_observe_dict.get(next_vp, ""),
+                    )
+                    step_data["ssa_delegate_decision"] = "delegate" if should_delegate else "continue"
+                    if should_delegate:
+                        ssa_plan_result = build_ssa_plan(envs, 0, ssa_proposal["estimate"])
+                        if ssa_plan_result.get("error") or not ssa_plan_result.get("actions"):
+                            nav_logger.info(f"[SSA] plan rejected | reason={ssa_plan_result.get('error', 'ssa_plan_empty')}")
+                            ssa_controller.used_this_episode = True
+                            step_data["ssa_plan_reason"] = str(ssa_plan_result.get("error", "ssa_plan_empty"))
+                            episode_ssa_trace["delegated"] = True
+                            episode_ssa_trace["takeover_reason"] = step_data["ssa_plan_reason"]
+                        else:
+                            ssa_takeover_requested = True
+                            step_data["ssa_delegated"] = True
+                            step_data["ssa_plan_reason"] = "planned"
+                            episode_ssa_trace["delegated"] = True
+                            nav_logger.info(
+                                f"[SSA] step={current_step} episode={episode_id} delegated=yes planned_actions={len(ssa_plan_result.get('actions', []))}"
+                            )
+                    else:
+                        episode_ssa_trace["delegate_declined_steps"].append(current_step)
+                        nav_logger.info(f"[SSA] step={current_step} episode={episode_id} delegated=no")
+
                 # Add step data to episode info
                 episode_info["steps"].append(step_data)
 
                 # Save history
-                curr_observe = observe_dict[next_vp]
+                curr_observe = filtered_observe_dict[next_vp]
                 nav_logger.info("========== save history ==========")
                 nav_history = navigator.save_history(nav_logger, current_step, next_vp, thought, curr_observe, nav_history)
 
                 # Only add image if not stuck (will be determined after env.step)
                 # For now, we'll add it and potentially remove it later if stuck
-                chosen_images.append(images_dict[next_vp]['rgb'].copy())
+                chosen_images.append(filtered_images_dict[next_vp]['rgb'].copy())
 
                 # Add description for this image
                 angle_deg = np.rad2deg(radius_dict[next_vp]) if next_vp in radius_dict else 0
@@ -913,6 +1067,10 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     if ssa_takeover_requested and ssa_plan_result is not None:
                         takeover = execute_ssa_takeover(envs, env_index=0, plan_result=ssa_plan_result)
                         nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
+                        episode_ssa_trace["takeover_success"] = bool(takeover.success)
+                        episode_ssa_trace["takeover_reason"] = str(takeover.reason)
+                        step_data["ssa_takeover_success"] = bool(takeover.success)
+                        step_data["ssa_takeover_reason"] = str(takeover.reason)
 
                         step_latency = time.time() - step_start_time
                         step_tokens = navigator.llm.get_step_tokens()
@@ -923,6 +1081,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         observations = takeover.observations
                         dones = takeover.dones
                         infos = takeover.infos
+                        low_level_rgb_frames.extend(
+                            [np.asarray(frame).astype(np.uint8).copy() for frame in takeover.rgb_frames]
+                        )
                         instruction, images_list = self.generate_input(observations[-1])
                         observations = extract_instruction_tokens(
                             observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID
@@ -932,6 +1093,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
                         if not dones[0]:
                             continue
+                        dones[0] = True
+                        break
 
                     env_actions = []
                     env_actions.append({'action':
@@ -954,6 +1117,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     nav_logger.info(f"Step {current_step} stats: latency={step_latency:.2f}s, input_tokens={step_tokens['input_tokens']}, output_tokens={step_tokens['output_tokens']}")
 
                     observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+                    step_low_rgb = _extract_low_level_rgb(observations[-1])
+                    if step_low_rgb is not None:
+                        low_level_rgb_frames.append(step_low_rgb)
                     instruction, images_list = self.generate_input(observations[-1])
 
                     # Check if agent is stuck (position hasn't changed)
@@ -1020,10 +1186,16 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     if not dones[i]:
                         continue
                     
+                    ep_id = str(envs.current_episodes()[i].episode_id)
+                    high_gif_frames = [np.asarray(img).astype(np.uint8) for img in chosen_images]
+                    _save_episode_rgb_gif(high_rgb_gif_dir, ep_id, high_gif_frames, nav_logger)
+                    _save_episode_rgb_gif(low_rgb_gif_dir, ep_id, list(low_level_rgb_frames), nav_logger)
+
                     current_step = 0
                     current_action_idx = 0
                     nav_history = []
                     chosen_images = []
+                    low_level_rgb_frames = []
                     chosen_images_descriptions = []
                     env_actions_history = []
                     backtrack_flag = False
@@ -1031,16 +1203,39 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     stuck_directions = set()  # Reset stuck directions for new episode
                     last_chosen_vp = None  # Reset last chosen viewpoint for new episode
                     ssa_controller.reset()
+                    episode_info["ssa_summary"] = {
+                        "proposal_seen": bool(episode_ssa_trace["proposal_seen"]),
+                        "delegated": bool(episode_ssa_trace["delegated"]),
+                        "takeover_success": bool(episode_ssa_trace["takeover_success"]),
+                        "takeover_reason": str(episode_ssa_trace["takeover_reason"]),
+                        "available_steps": list(episode_ssa_trace["available_steps"]),
+                        "delegate_declined_steps": list(episode_ssa_trace["delegate_declined_steps"]),
+                        "rejection_reasons": list(episode_ssa_trace["rejection_reasons"]),
+                        "proposal_estimates": list(episode_ssa_trace["proposal_estimates"]),
+                    }
+                    nav_logger.info(
+                        f"[SSA] episode summary | episode={ep_id} "
+                        f"proposal_seen={episode_ssa_trace['proposal_seen']} "
+                        f"delegated={episode_ssa_trace['delegated']} "
+                        f"takeover_success={episode_ssa_trace['takeover_success']} "
+                        f"takeover_reason={episode_ssa_trace['takeover_reason'] or 'none'} "
+                        f"available_steps={episode_ssa_trace['available_steps']} "
+                        f"delegate_declined_steps={episode_ssa_trace['delegate_declined_steps']} "
+                        f"rejection_reasons={episode_ssa_trace['rejection_reasons']}"
+                    )
+                    episode_ssa_trace = _new_ssa_episode_trace()
 
                     # Add initial image for new episode
                     if '0' in images_list:
                         chosen_images.append(images_list['0']['rgb'].copy())
                         chosen_images_descriptions.append("Initial position: Agent standing at start point looking forward")
                         nav_logger.info("Added initial forward-looking image for new episode")
+                    next_init_low_rgb = _extract_low_level_rgb(observations[i])
+                    if next_init_low_rgb is not None:
+                        low_level_rgb_frames.append(next_init_low_rgb)
                     info = infos[i]
                     metric = {}
                     metric['steps_taken'] = info['steps_taken']
-                    ep_id = str(envs.current_episodes()[i].episode_id)
                     gt_path = np.array(self.gt_data[ep_id]['locations']).astype(float)
                     if 'current_path' in envs.current_episodes()[i].info.keys():
                         positions_ = np.array(envs.current_episodes()[i].info['current_path']).astype(float)
@@ -1143,19 +1338,19 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     not_done_masks,
                     headings,  
                     batch,
-                    rgb_frames,
+                    _,
                 ) = self._pause_envs(
                     envs_to_pause,
                     envs,
                     not_done_masks,
                     headings,
                     batch,
-                    rgb_frames,
                 )
                 headings = headings.tolist()
-            except Exception as e:
-                nav_logger.info(f"Error in next action prediction: {e}")
-                current_step -= 1
+            except Exception:
+                nav_logger.exception("Fatal error in 3-step navigation loop")
+                envs.close()
+                raise
         envs.close()
         if config.use_pbar:
             pbar.close()

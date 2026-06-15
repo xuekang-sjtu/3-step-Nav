@@ -157,12 +157,19 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self._env.sim.get_agent_state().position,
             self._env.sim.get_agent_state().rotation,
         )
+        rgb_frames = []
+        rgb = observations.get("rgb")
+        if rgb is not None:
+            rgb_frames.append(np.asarray(rgb)[..., :3].astype(np.uint8).copy())
         info = self.get_info(observations)
         success = False
         reason = str(plan_result.get("error", "") or "plan_exhausted")
         for idx, action in enumerate(actions):
             prev_position = np.asarray(self._env.sim.get_agent_state().position, dtype=np.float32)
             observations = self._env.step(action)
+            rgb = observations.get("rgb")
+            if rgb is not None:
+                rgb_frames.append(np.asarray(rgb)[..., :3].astype(np.uint8).copy())
             positions = observations.pop("positions", [])
             collisions = observations.pop("collisions", [])
             if positions or collisions:
@@ -171,18 +178,18 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             done = self.get_done(observations)
             if done:
                 reason = "episode_done"
-                return {"observations": observations, "done": done, "info": info, "success": False, "reason": reason, "actions_executed": idx + 1}
+                return {"observations": observations, "done": done, "info": info, "success": False, "reason": reason, "actions_executed": idx + 1, "rgb_frames": rgb_frames}
             if action == 1:
                 curr_position = np.asarray(self._env.sim.get_agent_state().position, dtype=np.float32)
                 if float(np.linalg.norm(curr_position - prev_position)) < 0.05:
                     reason = "forward_progress_failed"
-                    return {"observations": observations, "done": done, "info": info, "success": False, "reason": reason, "actions_executed": idx + 1}
+                    return {"observations": observations, "done": done, "info": info, "success": False, "reason": reason, "actions_executed": idx + 1, "rgb_frames": rgb_frames}
             if self._ssa_planner.reached_target(self._env, target_position, target_yaw_deg):
                 success = True
                 reason = "reached_target"
-                return {"observations": observations, "done": done, "info": info, "success": success, "reason": reason, "actions_executed": idx + 1}
+                return {"observations": observations, "done": done, "info": info, "success": success, "reason": reason, "actions_executed": idx + 1, "rgb_frames": rgb_frames}
         done = self.get_done(observations)
-        return {"observations": observations, "done": done, "info": info, "success": success, "reason": reason, "actions_executed": len(actions)}
+        return {"observations": observations, "done": done, "info": info, "success": success, "reason": reason, "actions_executed": len(actions), "rgb_frames": rgb_frames}
         
 
 @baseline_registry.register_env(name="VLNCEInferenceEnv")
