@@ -1064,6 +1064,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
             try:
                 if not stop_flag:
+                    ssa_takeover_finished_episode = False
                     if ssa_takeover_requested and ssa_plan_result is not None:
                         takeover = execute_ssa_takeover(envs, env_index=0, plan_result=ssa_plan_result)
                         nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
@@ -1093,87 +1094,87 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
                         if not dones[0]:
                             continue
-                        dones[0] = True
-                        break
+                        ssa_takeover_finished_episode = True
 
-                    env_actions = []
-                    env_actions.append({'action':
-                        {'action': 4,
-                        'action_args':{
-                            'angle': radius_dict[next_vp],
-                            'distance': distance_dict[next_vp],
-                        }}})
-                    nav_logger.info(f"The final env action: {env_actions}")
-                    # Record the action for potential backtracking
-                    env_actions_history.append(env_actions[0])
-                    outputs = envs.step(env_actions)
+                    if not ssa_takeover_finished_episode:
+                        env_actions = []
+                        env_actions.append({'action':
+                            {'action': 4,
+                            'action_args':{
+                                'angle': radius_dict[next_vp],
+                                'distance': distance_dict[next_vp],
+                            }}})
+                        nav_logger.info(f"The final env action: {env_actions}")
+                        # Record the action for potential backtracking
+                        env_actions_history.append(env_actions[0])
+                        outputs = envs.step(env_actions)
 
-                    # Step completed - record step statistics
-                    step_latency = time.time() - step_start_time
-                    step_tokens = navigator.llm.get_step_tokens()
-                    episode_step_latencies.append(step_latency)
-                    episode_step_input_tokens.append(step_tokens['input_tokens'])
-                    episode_step_output_tokens.append(step_tokens['output_tokens'])
-                    nav_logger.info(f"Step {current_step} stats: latency={step_latency:.2f}s, input_tokens={step_tokens['input_tokens']}, output_tokens={step_tokens['output_tokens']}")
+                        # Step completed - record step statistics
+                        step_latency = time.time() - step_start_time
+                        step_tokens = navigator.llm.get_step_tokens()
+                        episode_step_latencies.append(step_latency)
+                        episode_step_input_tokens.append(step_tokens['input_tokens'])
+                        episode_step_output_tokens.append(step_tokens['output_tokens'])
+                        nav_logger.info(f"Step {current_step} stats: latency={step_latency:.2f}s, input_tokens={step_tokens['input_tokens']}, output_tokens={step_tokens['output_tokens']}")
 
-                    observations, _, dones, infos = [list(x) for x in zip(*outputs)]
-                    step_low_rgb = _extract_low_level_rgb(observations[-1])
-                    if step_low_rgb is not None:
-                        low_level_rgb_frames.append(step_low_rgb)
-                    instruction, images_list = self.generate_input(observations[-1])
+                        observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+                        step_low_rgb = _extract_low_level_rgb(observations[-1])
+                        if step_low_rgb is not None:
+                            low_level_rgb_frames.append(step_low_rgb)
+                        instruction, images_list = self.generate_input(observations[-1])
 
-                    # Check if agent is stuck (position hasn't changed)
-                    is_stuck = False
-                    if current_step == step_length:
-                        dones[0] = True
-                    else:
-                        for j, ob in enumerate(observations):
-                            new_positions = ob.pop('positions')
-                            new_collisions = ob.pop('collisions')
+                        # Check if agent is stuck (position hasn't changed)
+                        is_stuck = False
+                        if current_step == step_length:
+                            dones[0] = True
+                        else:
+                            for j, ob in enumerate(observations):
+                                new_positions = ob.pop('positions')
+                                new_collisions = ob.pop('collisions')
 
-                            # Check if stuck: compare current position with previous position
-                            if previous_position is not None and len(new_positions) > 0:
-                                current_position = new_positions[-1]
-                                position_diff = np.linalg.norm(np.array(current_position) - np.array(previous_position))
+                                # Check if stuck: compare current position with previous position
+                                if previous_position is not None and len(new_positions) > 0:
+                                    current_position = new_positions[-1]
+                                    position_diff = np.linalg.norm(np.array(current_position) - np.array(previous_position))
 
-                                if position_diff < 0.1:  # Threshold: if moved less than 0.1 meters, consider stuck
-                                    is_stuck = True
-                                    nav_logger.warning(f"Agent is STUCK! Position changed by only {position_diff:.4f}m")
-                                    nav_logger.warning(f"Previous position: {previous_position}")
-                                    nav_logger.warning(f"Current position: {current_position}")
+                                    if position_diff < 0.1:  # Threshold: if moved less than 0.1 meters, consider stuck
+                                        is_stuck = True
+                                        nav_logger.warning(f"Agent is STUCK! Position changed by only {position_diff:.4f}m")
+                                        nav_logger.warning(f"Previous position: {previous_position}")
+                                        nav_logger.warning(f"Current position: {current_position}")
 
-                                    # Add the stuck direction to the blacklist
-                                    if last_chosen_vp is not None:
-                                        stuck_directions.add(last_chosen_vp)
-                                        nav_logger.warning(f"Added direction '{last_chosen_vp}' to stuck directions blacklist")
-                                        nav_logger.warning(f"Total stuck directions: {stuck_directions}")
+                                        # Add the stuck direction to the blacklist
+                                        if last_chosen_vp is not None:
+                                            stuck_directions.add(last_chosen_vp)
+                                            nav_logger.warning(f"Added direction '{last_chosen_vp}' to stuck directions blacklist")
+                                            nav_logger.warning(f"Total stuck directions: {stuck_directions}")
 
-                                    # Remove the last added image and description since we're stuck
-                                    if len(chosen_images) > 0:
-                                        removed_img = chosen_images.pop()
-                                        nav_logger.warning(f"Removed stuck observation image (total images now: {len(chosen_images)})")
-                                    if len(chosen_images_descriptions) > 0:
-                                        removed_desc = chosen_images_descriptions.pop()
-                                        nav_logger.warning(f"Removed stuck image description: {removed_desc}")
+                                        # Remove the last added image and description since we're stuck
+                                        if len(chosen_images) > 0:
+                                            removed_img = chosen_images.pop()
+                                            nav_logger.warning(f"Removed stuck observation image (total images now: {len(chosen_images)})")
+                                        if len(chosen_images_descriptions) > 0:
+                                            removed_desc = chosen_images_descriptions.pop()
+                                            nav_logger.warning(f"Removed stuck image description: {removed_desc}")
 
-                                    # Also remove from nav_history since this movement failed
-                                    if len(nav_history) > 0:
-                                        nav_history.pop()
-                                        nav_logger.warning("Removed last navigation history entry due to stuck")
-                                else:
-                                    nav_logger.info(f"Agent moved {position_diff:.4f}m successfully")
+                                        # Also remove from nav_history since this movement failed
+                                        if len(nav_history) > 0:
+                                            nav_history.pop()
+                                            nav_logger.warning("Removed last navigation history entry due to stuck")
+                                    else:
+                                        nav_logger.info(f"Agent moved {position_diff:.4f}m successfully")
 
-                                # Update previous position
-                                previous_position = current_position
-                            elif len(new_positions) > 0:
-                                # First movement, just record position
-                                previous_position = new_positions[-1]
+                                    # Update previous position
+                                    previous_position = current_position
+                                elif len(new_positions) > 0:
+                                    # First movement, just record position
+                                    previous_position = new_positions[-1]
 
-                            envs.call_at(j,
-                                'change_current_path',
-                                {'new_path': new_positions,
-                                'collisions': new_collisions}
-                            )
+                                envs.call_at(j,
+                                    'change_current_path',
+                                    {'new_path': new_positions,
+                                    'collisions': new_collisions}
+                                )
                 else:
                     dones[0] = True
                 
