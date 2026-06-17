@@ -68,7 +68,8 @@ from ..models.utils import (
     length2mask, dir_angle_feature, dir_angle_feature_with_ele,
 )
 from shared.eval_metrics import format_episode_metric
-from shared.ssa import SSAController, ask_ssa_delegate, build_ssa_plan, execute_ssa_takeover
+from shared.ssa import SSAController, ask_ssa_delegate_with_result, build_ssa_plan, execute_ssa_takeover
+from shared.ssa.trajectory import save_trajectory_debug
 
 
 def _ssa_front_view(images_dict):
@@ -530,6 +531,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             checkpoint_path=getattr(config, "SSA_CHECKPOINT", ""),
             detect_threshold=float(getattr(config, "SSA_DETECT_THRESHOLD", 0.5)),
             detector_model_source=getattr(config, "SSA_DETECTOR_MODEL_SOURCE", None),
+            filter_behind=getattr(config, "SSA_FILTER_BEHIND", False),
         )
         current_step = 0
         current_action_idx = 0
@@ -811,7 +813,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 if not ssa_subtask_active:
                     ssa_proposal = {
                         "available": False,
-                        "reason": "not_stair_subtask",
+                        "reason": "not_current_stair_stage",
                     }
                 elif selected_ssa_view is None:
                     ssa_proposal = {
@@ -820,8 +822,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     }
                 else:
                     ssa_proposal = ssa_controller.update_proposal(
-                        instruction=current_action,
-                        previous_output="",
+                        instruction="",
+                        previous_output=current_action,
                         previous_plan=" ".join(str(item) for item in current_landmarks if item),
                         rgb=np.asarray(selected_ssa_view["rgb"]),
                         depth=np.asarray(selected_ssa_view["depth"]),
@@ -870,23 +872,41 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     )
 
                 if ssa_proposal.get("available", False):
-                    should_delegate = ask_ssa_delegate(
+                    current_stage_text = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
+                    delegate_result = ask_ssa_delegate_with_result(
                         infer_fn=lambda system_prompt, user_prompt: navigator.llm.gpt_infer_with_images(
                             system_prompt,
                             user_prompt,
                             images={"0": selected_ssa_view},
                         ),
-                        instruction=instruction,
-                        current_stage=action_list[current_action_idx] if current_action_idx < len(action_list) else "",
+                        image_infer_fn=lambda system_prompt, user_prompt, images: navigator.llm.gpt_infer_with_images(
+                            system_prompt,
+                            user_prompt,
+                            images=images,
+                        ),
+                        image=selected_ssa_view["rgb"],
+                        instruction="",
+                        current_stage=current_stage_text,
                         history=history_traj,
                         observation_hint=filtered_observe_dict.get(next_vp, ""),
                     )
+                    should_delegate = bool(delegate_result["delegated"])
                     step_data["ssa_delegate_decision"] = "delegate" if should_delegate else "continue"
-                    ssa_controller.record_delegate_decision(step=current_step, delegated=bool(should_delegate))
+                    ssa_controller.record_delegate_decision(
+                        step=current_step,
+                        delegated=bool(should_delegate),
+                        current_stage=current_stage_text,
+                        history=history_traj,
+                        observation_hint=filtered_observe_dict.get(next_vp, ""),
+                        prompt_has_rgb=bool(delegate_result.get("prompt_has_rgb", False)),
+                        raw_response=str(delegate_result.get("raw_response", "")),
+                        reason=str(delegate_result.get("decision_reason", "")),
+                    )
                     if should_delegate:
                         ssa_controller.used_this_episode = True
                         ssa_plan_result = build_ssa_plan(envs, 0, ssa_proposal["estimate"])
-                        if ssa_plan_result.get("error") or not ssa_plan_result.get("actions"):
+                        planned_steps = len(ssa_plan_result.get("rollout_steps", []) or []) or len(ssa_plan_result.get("actions", []) or [])
+                        if ssa_plan_result.get("error") or planned_steps == 0:
                             nav_logger.info(f"[SSA] plan rejected | reason={ssa_plan_result.get('error', 'ssa_plan_empty')}")
                             step_data["ssa_plan_reason"] = str(ssa_plan_result.get("error", "ssa_plan_empty"))
                             episode_ssa_trace["delegated"] = True
@@ -907,11 +927,11 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                                 step=current_step,
                                 accepted=True,
                                 reason="planned",
-                                planned_actions=len(ssa_plan_result.get("actions", [])),
+                                planned_actions=planned_steps,
                             )
                             ssa_controller.enrich_last_plan_outcome(ssa_plan_result)
                             nav_logger.info(
-                                f"[SSA] step={current_step} episode={episode_id} delegated=yes planned_actions={len(ssa_plan_result.get('actions', []))}"
+                                f"[SSA] step={current_step} episode={episode_id} delegated=yes planned_actions={planned_steps}"
                             )
                     else:
                         episode_ssa_trace["delegate_declined_steps"].append(current_step)
@@ -1348,6 +1368,28 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     self._save_episode_result(current_episodes[i].episode_id, metric, config, current_episode_debug,
                                              global_total_latency, global_total_input_tokens,
                                              global_total_output_tokens, global_total_steps)
+                    ssa_trace = ssa_controller.episode_trace()
+                    ssa_trajectory = []
+                    for result in ssa_trace.get("takeover_results", []) or []:
+                        ssa_trajectory.extend(result.get("ssa_trajectory", []) or [])
+                    save_trajectory_debug(
+                        output_dir=config.EVAL_CKPT_PATH_DIR,
+                        episode_id=str(current_episodes[i].episode_id),
+                        payload={
+                            "episode_id": str(current_episodes[i].episode_id),
+                            "scene_id": current_episodes[i].scene_id,
+                            "metric": metric,
+                            "start_position": positions_[0].tolist() if len(positions_) else [],
+                            "goal_position": gt_path[-1].tolist() if len(gt_path) else [],
+                            "agent_trajectory": [
+                                {"step": int(j), "source": "agent", "position": pos.tolist()}
+                                for j, pos in enumerate(positions_)
+                            ],
+                            "ssa_trajectory": ssa_trajectory,
+                            "expert_trajectory": gt_path.tolist(),
+                            "ssa_trace": ssa_trace,
+                        },
+                    )
 
                     observations[i] = envs.reset_at(i)[0]
                     instruction, images_list = self.generate_input(observations[i])
