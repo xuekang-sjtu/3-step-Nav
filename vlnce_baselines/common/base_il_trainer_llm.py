@@ -67,6 +67,7 @@ from ..utils import get_camera_orientations
 from ..models.utils import (
     length2mask, dir_angle_feature, dir_angle_feature_with_ele,
 )
+from shared.eval_metrics import format_episode_metric
 from shared.ssa import SSAController, ask_ssa_delegate, build_ssa_plan, execute_ssa_takeover
 
 
@@ -515,7 +516,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         if not os.path.exists(f"cache_files/{dataset_name}"):
             os.makedirs(f"cache_files/{dataset_name}")
 
-        actions_cache_path = f"./cache_files/{dataset_name}/actions_cache.json"
+        actions_cache_path = f"./cache_files/{dataset_name}/actions_cache_3step-nav.json"
         if os.path.exists(actions_cache_path): 
             with open(actions_cache_path, "r", encoding="utf-8") as file:
                 actions_cache = json.load(file)
@@ -677,6 +678,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     episode_ssa_trace = _new_ssa_episode_trace()
             actions, landmark_list = "", []
             if instruction not in actions_cache.keys():
+                nav_logger.info("[Cache MISS] Calling LLM to decompose instruction...")
                 actions = navigator.get_actions(instruction)
                 action_list = actions.split("\n")
                 # Extract landmarks for each action individually
@@ -691,7 +693,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 actions_cache[instruction] = {"actions": actions, "landmark_list": landmark_list}
                 with open(actions_cache_path, "w", encoding="utf-8") as f2:
                     json.dump(actions_cache, f2, indent=2)
+                nav_logger.info("[Cache SAVED] Instruction cached to disk")
             else:
+                nav_logger.info("[Cache HIT] Reusing cached instruction decomposition")
                 actions = actions_cache[instruction]["actions"]
                 landmark_list = actions_cache[instruction]["landmark_list"]
 
@@ -826,6 +830,13 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
                 step_data["ssa_delegated"] = False
                 step_data["ssa_reason"] = str(ssa_proposal.get("reason", ""))
+                ssa_controller.record_step_proposal(
+                    step=current_step,
+                    available=step_data["ssa_available"],
+                    reason=step_data["ssa_reason"],
+                    viewpoint=step_data["ssa_viewpoint"],
+                    view_yaw_deg=step_data["ssa_view_yaw_deg"],
+                )
                 ssa_estimate = SSAController._compact_estimate(ssa_proposal.get("estimate"))
                 if ssa_estimate:
                     step_data["ssa_estimate"] = ssa_estimate
@@ -871,19 +882,34 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         observation_hint=filtered_observe_dict.get(next_vp, ""),
                     )
                     step_data["ssa_delegate_decision"] = "delegate" if should_delegate else "continue"
+                    ssa_controller.record_delegate_decision(step=current_step, delegated=bool(should_delegate))
                     if should_delegate:
+                        ssa_controller.used_this_episode = True
                         ssa_plan_result = build_ssa_plan(envs, 0, ssa_proposal["estimate"])
                         if ssa_plan_result.get("error") or not ssa_plan_result.get("actions"):
                             nav_logger.info(f"[SSA] plan rejected | reason={ssa_plan_result.get('error', 'ssa_plan_empty')}")
-                            ssa_controller.used_this_episode = True
                             step_data["ssa_plan_reason"] = str(ssa_plan_result.get("error", "ssa_plan_empty"))
                             episode_ssa_trace["delegated"] = True
                             episode_ssa_trace["takeover_reason"] = step_data["ssa_plan_reason"]
+                            ssa_controller.record_plan_outcome(
+                                step=current_step,
+                                accepted=False,
+                                reason=step_data["ssa_plan_reason"],
+                                planned_actions=0,
+                            )
+                            ssa_controller.enrich_last_plan_outcome(ssa_plan_result)
                         else:
                             ssa_takeover_requested = True
                             step_data["ssa_delegated"] = True
                             step_data["ssa_plan_reason"] = "planned"
                             episode_ssa_trace["delegated"] = True
+                            ssa_controller.record_plan_outcome(
+                                step=current_step,
+                                accepted=True,
+                                reason="planned",
+                                planned_actions=len(ssa_plan_result.get("actions", [])),
+                            )
+                            ssa_controller.enrich_last_plan_outcome(ssa_plan_result)
                             nav_logger.info(
                                 f"[SSA] step={current_step} episode={episode_id} delegated=yes planned_actions={len(ssa_plan_result.get('actions', []))}"
                             )
@@ -1072,6 +1098,13 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         episode_ssa_trace["takeover_reason"] = str(takeover.reason)
                         step_data["ssa_takeover_success"] = bool(takeover.success)
                         step_data["ssa_takeover_reason"] = str(takeover.reason)
+                        ssa_controller.record_takeover_result(
+                            step=current_step,
+                            success=bool(takeover.success),
+                            reason=str(takeover.reason),
+                            actions_executed=int(takeover.actions_executed),
+                        )
+                        ssa_controller.enrich_last_takeover_result(takeover.raw_result)
 
                         step_latency = time.time() - step_start_time
                         step_tokens = navigator.llm.get_step_tokens()
@@ -1203,7 +1236,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     previous_position = None  # Reset position tracking for new episode
                     stuck_directions = set()  # Reset stuck directions for new episode
                     last_chosen_vp = None  # Reset last chosen viewpoint for new episode
-                    ssa_controller.reset()
+                    ssa_trace = ssa_controller.episode_trace()
                     episode_info["ssa_summary"] = {
                         "proposal_seen": bool(episode_ssa_trace["proposal_seen"]),
                         "delegated": bool(episode_ssa_trace["delegated"]),
@@ -1214,6 +1247,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         "rejection_reasons": list(episode_ssa_trace["rejection_reasons"]),
                         "proposal_estimates": list(episode_ssa_trace["proposal_estimates"]),
                     }
+                    episode_info["ssa_trace"] = ssa_trace
                     nav_logger.info(
                         f"[SSA] episode summary | episode={ep_id} "
                         f"proposal_seen={episode_ssa_trace['proposal_seen']} "
@@ -1224,6 +1258,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         f"delegate_declined_steps={episode_ssa_trace['delegate_declined_steps']} "
                         f"rejection_reasons={episode_ssa_trace['rejection_reasons']}"
                     )
+                    ssa_controller.reset()
                     episode_ssa_trace = _new_ssa_episode_trace()
 
                     # Add initial image for new episode
@@ -1292,6 +1327,14 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     episode_step_output_tokens = []
 
                     stats_episodes[current_episodes[i].episode_id] = metric
+                    nav_logger.info(
+                        format_episode_metric(
+                            current_episodes[i].episode_id,
+                            metric,
+                            stats=stats_episodes,
+                            total=episodes_to_eval,
+                        )
+                    )
 
                     # Find current episode debug info to save with results
                     current_episode_debug = None
