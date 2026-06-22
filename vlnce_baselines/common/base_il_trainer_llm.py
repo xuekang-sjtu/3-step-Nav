@@ -940,46 +940,49 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 # Add step data to episode info
                 episode_info["steps"].append(step_data)
 
-                # Save history
-                curr_observe = filtered_observe_dict[next_vp]
-                nav_logger.info("========== save history ==========")
-                nav_history = navigator.save_history(nav_logger, current_step, next_vp, thought, curr_observe, nav_history)
+                if ssa_takeover_requested:
+                    nav_logger.info("Delaying history/GIF update until SSA final observation is available")
+                else:
+                    # Save history for a normal VLM-selected waypoint.
+                    curr_observe = filtered_observe_dict[next_vp]
+                    nav_logger.info("========== save history ==========")
+                    nav_history = navigator.save_history(nav_logger, current_step, next_vp, thought, curr_observe, nav_history)
 
-                # Only add image if not stuck (will be determined after env.step)
-                # For now, we'll add it and potentially remove it later if stuck
-                chosen_images.append(filtered_images_dict[next_vp]['rgb'].copy())
+                    # Only add image if not stuck (will be determined after env.step)
+                    # For now, we'll add it and potentially remove it later if stuck
+                    chosen_images.append(filtered_images_dict[next_vp]['rgb'].copy())
 
-                # Add description for this image
-                angle_deg = np.rad2deg(radius_dict[next_vp]) if next_vp in radius_dict else 0
-                direction_desc = ""
-                if -15 <= angle_deg <= 15:
-                    direction_desc = "forward"
-                elif 15 < angle_deg <= 45:
-                    direction_desc = "front-left (30°)"
-                elif 45 < angle_deg <= 75:
-                    direction_desc = "left (60°)"
-                elif 75 < angle_deg <= 105:
-                    direction_desc = "left (90°)"
-                elif 105 < angle_deg <= 135:
-                    direction_desc = "back-left (120°)"
-                elif 135 < angle_deg <= 165:
-                    direction_desc = "back-left (150°)"
-                elif angle_deg > 165 or angle_deg < -165:
-                    direction_desc = "backward (180°)"
-                elif -165 <= angle_deg < -135:
-                    direction_desc = "back-right (150°)"
-                elif -135 <= angle_deg < -105:
-                    direction_desc = "back-right (120°)"
-                elif -105 <= angle_deg < -75:
-                    direction_desc = "right (90°)"
-                elif -75 <= angle_deg < -45:
-                    direction_desc = "right (60°)"
-                elif -45 <= angle_deg < -15:
-                    direction_desc = "front-right (30°)"
-                
-                image_desc = f"Step {current_step}: Agent at previous position looking {direction_desc} towards chosen next viewpoint"
-                chosen_images_descriptions.append(image_desc)
-                nav_logger.info(f"Added image with description: {image_desc}")
+                    # Add description for this image
+                    angle_deg = np.rad2deg(radius_dict[next_vp]) if next_vp in radius_dict else 0
+                    direction_desc = ""
+                    if -15 <= angle_deg <= 15:
+                        direction_desc = "forward"
+                    elif 15 < angle_deg <= 45:
+                        direction_desc = "front-left (30°)"
+                    elif 45 < angle_deg <= 75:
+                        direction_desc = "left (60°)"
+                    elif 75 < angle_deg <= 105:
+                        direction_desc = "left (90°)"
+                    elif 105 < angle_deg <= 135:
+                        direction_desc = "back-left (120°)"
+                    elif 135 < angle_deg <= 165:
+                        direction_desc = "back-left (150°)"
+                    elif angle_deg > 165 or angle_deg < -165:
+                        direction_desc = "backward (180°)"
+                    elif -165 <= angle_deg < -135:
+                        direction_desc = "back-right (150°)"
+                    elif -135 <= angle_deg < -105:
+                        direction_desc = "back-right (120°)"
+                    elif -105 <= angle_deg < -75:
+                        direction_desc = "right (90°)"
+                    elif -75 <= angle_deg < -45:
+                        direction_desc = "right (60°)"
+                    elif -45 <= angle_deg < -15:
+                        direction_desc = "front-right (30°)"
+
+                    image_desc = f"Step {current_step}: Agent at previous position looking {direction_desc} towards chosen next viewpoint"
+                    chosen_images_descriptions.append(image_desc)
+                    nav_logger.info(f"Added image with description: {image_desc}")
 
                 nav_logger.info("========== Review History after navigation ==========")
                 history_traj = navigator.review_history(nav_logger, nav_history) if len(nav_history) > 0 else "Step 0 start position. "
@@ -1139,6 +1142,33 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             [np.asarray(frame).astype(np.uint8).copy() for frame in takeover.rgb_frames]
                         )
                         instruction, images_list = self.generate_input(observations[-1])
+                        final_ssa_view = images_list.get("0") if isinstance(images_list, dict) else None
+                        if final_ssa_view is not None:
+                            _, final_observe_dict = navigator.observe_environment(
+                                nav_logger,
+                                current_step,
+                                {"0": final_ssa_view},
+                            )
+                            ssa_thought = (
+                                f"SSA takeover executed {takeover.actions_executed} waypoint steps; "
+                                f"result={takeover.reason}."
+                            )
+                            nav_logger.info("========== save SSA history ==========")
+                            nav_history = navigator.save_history(
+                                nav_logger,
+                                current_step,
+                                "0",
+                                ssa_thought,
+                                final_observe_dict["0"],
+                                nav_history,
+                            )
+                            chosen_images.append(final_ssa_view["rgb"].copy())
+                            chosen_images_descriptions.append(
+                                f"Step {current_step}: SSA takeover final forward view after local stair alignment"
+                            )
+                            step_data["ssa_history_recorded"] = True
+                        else:
+                            nav_logger.warning("SSA final forward view missing; history/GIF high frame not updated")
                         observations = extract_instruction_tokens(
                             observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID
                         )
