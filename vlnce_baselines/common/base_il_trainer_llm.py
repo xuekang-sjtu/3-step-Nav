@@ -11,6 +11,8 @@ import imageio
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+from shared.evaluation_selection import filter_ids_by_cross_floor
+from shared.results import aggregate_numeric_metrics
 from collections import defaultdict
 from typing import Dict, List
 from PIL import Image
@@ -1449,17 +1451,12 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             pbar.close()
         if self.world_size > 1:
             distr.barrier()
-        aggregated_stats = {}
-        valid_stats = [value for value in stats_episodes.values() if value is not None]
+        valid_stats = [value for value in stats_episodes.values() if isinstance(value, dict)]
         num_episodes = len(valid_stats)
         if num_episodes == 0:
             logger.info("No newly evaluated episodes with metrics were produced in this run.")
             return
-        for stat_key in valid_stats[0].keys():
-            aggregated_stats[stat_key] = (
-                sum(v[stat_key] for v in valid_stats)
-                / num_episodes
-            )
+        aggregated_stats = aggregate_numeric_metrics(stats_episodes)
         total = torch.tensor(num_episodes).cuda()
         if self.world_size > 1:
             distr.reduce(total,dst=0)
@@ -1519,10 +1516,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         # Apply cross-floor filter if EPISODES_ALLOWED is explicitly set
         allowed = self.config.TASK_CONFIG.DATASET.EPISODES_ALLOWED
         if allowed is not None:
-            allowed_set = set(allowed)
-            # trajectories are always str (JSON dict keys); allowed may be int or str
-            trajectories = [t for t in trajectories
-                            if t in allowed_set or int(t) in allowed_set]
+            trajectories = filter_ids_by_cross_floor(trajectories, allowed)
         return trajectories
 
     def _save_episode_result(self, episode_id, metric, config, debug_episode_info=None,
@@ -1585,24 +1579,20 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         if num_episodes == 0:
             return
 
-        # Helper function to check if a value is valid (not NaN or Infinity)
-        def is_valid_number(x):
-            return x is not None and not math.isnan(x) and not math.isinf(x)
-
         # Keys to exclude from episode-level averaging (step-level stats handled separately)
         step_level_keys = {'avg_latency_per_step', 'avg_input_tokens_per_step', 'avg_output_tokens_per_step',
                           'total_latency', 'total_input_tokens', 'total_output_tokens'}
 
-        aggregated_stats = {}
-        for stat_key in next(iter(episode_results.values())).keys():
-            if stat_key in step_level_keys:
-                continue
-            # Filter out invalid values (NaN, Infinity)
-            valid_values = [v[stat_key] for v in episode_results.values() if is_valid_number(v[stat_key])]
-            if len(valid_values) > 0:
-                aggregated_stats[stat_key] = sum(valid_values) / len(valid_values)
-            else:
-                aggregated_stats[stat_key] = 0.0  # Default to 0 if no valid values
+        episode_level_metrics = {
+            episode_id: {
+                key: value
+                for key, value in metric.items()
+                if key not in step_level_keys
+            }
+            for episode_id, metric in episode_results.items()
+            if isinstance(metric, dict)
+        }
+        aggregated_stats = aggregate_numeric_metrics(episode_level_metrics)
 
         # Add episode count
         aggregated_stats['episodes_evaluated'] = num_episodes
