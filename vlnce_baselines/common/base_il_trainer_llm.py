@@ -539,6 +539,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             oracle_exit_enabled=getattr(config, "SSA_ORACLE_EXIT_ENABLE", False),
             max_takeovers_per_episode=int(getattr(config, "SSA_MAX_TAKEOVERS_PER_EPISODE", 1)),
         )
+        ssa_enabled = bool(getattr(ssa_controller, "enabled", False))
         current_step = 0
         current_action_idx = 0
         nav_history = []
@@ -684,10 +685,11 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     }
                     debug_info["episodes"].append(episode_info)
                     episode_ssa_trace = _new_ssa_episode_trace()
-            actions, landmark_list = "", []
+            actions, landmarks, landmark_list = "", "", []
             if instruction not in actions_cache.keys():
                 nav_logger.info("[Cache MISS] Calling LLM to decompose instruction...")
                 actions = navigator.get_actions(instruction)
+                landmarks = navigator.get_landmarks(actions)
                 action_list = actions.split("\n")
                 # Extract landmarks for each action individually
                 landmark_list = []
@@ -698,27 +700,60 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     else:
                         landmark_list.append("")
                         nav_logger.info(f"Action {i} is empty, skipping landmark extraction")
-                actions_cache[instruction] = {"actions": actions, "landmark_list": landmark_list}
+                actions_cache[instruction] = {
+                    "actions": actions,
+                    "landmarks": landmarks,
+                    "landmark_list": landmark_list,
+                }
                 with open(actions_cache_path, "w", encoding="utf-8") as f2:
                     json.dump(actions_cache, f2, indent=2)
                 nav_logger.info("[Cache SAVED] Instruction cached to disk")
             else:
                 nav_logger.info("[Cache HIT] Reusing cached instruction decomposition")
                 actions = actions_cache[instruction]["actions"]
-                landmark_list = actions_cache[instruction]["landmark_list"]
+                landmarks = actions_cache[instruction].get("landmarks", "")
+                landmark_list = actions_cache[instruction].get("landmark_list", [])
+                if not landmarks:
+                    if ssa_enabled and landmark_list:
+                        landmarks = "\n".join(
+                            ", ".join(item) if isinstance(item, list) else str(item)
+                            for item in landmark_list
+                        )
+                    else:
+                        landmarks = navigator.get_landmarks(actions)
+                        actions_cache[instruction]["landmarks"] = landmarks
+                        with open(actions_cache_path, "w", encoding="utf-8") as f2:
+                            json.dump(actions_cache, f2, indent=2)
+                if not landmark_list and ssa_enabled:
+                    landmark_list = []
+                    for action in actions.split("\n"):
+                        if action.strip():
+                            action_landmarks = navigator.get_landmarks(action)
+                            landmark_list.append(action_landmarks.replace("- ", "").split("\n"))
+                        else:
+                            landmark_list.append("")
+                    actions_cache[instruction]["landmark_list"] = landmark_list
+                    with open(actions_cache_path, "w", encoding="utf-8") as f2:
+                        json.dump(actions_cache, f2, indent=2)
 
             action_list = actions.split("\n")
+            if not landmark_list:
+                landmark_list = [landmarks for _ in action_list]
 
             # Store sub-instructions and landmarks in episode_info for the first step
             if current_step == 0:  # First step after initialization
                 nav_logger.info("Sub-instructions: "+str(action_list))
-                nav_logger.info("Landmarks: " + str(landmark_list))
+                nav_logger.info("Landmarks: " + (str(landmark_list) if ssa_enabled else landmarks))
 
                 episode_info["sub_instructions"] = action_list
-                episode_info["landmarks"] = landmark_list
+                episode_info["landmarks"] = landmark_list if ssa_enabled else landmarks
 
-            # Use MAX_EPISODE_STEPS from config instead of hardcoded values
-            step_length = self.config.TASK_CONFIG.ENVIRONMENT.MAX_EPISODE_STEPS
+            # Preserve the original 3-step stopping budget when SSA is disabled.
+            step_length = (
+                self.config.TASK_CONFIG.ENVIRONMENT.MAX_EPISODE_STEPS
+                if ssa_enabled
+                else (6 if len(action_list) <= 6 else 8)
+            )
 
             stop_flag = False
             current_step += 1
@@ -771,7 +806,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
 
             current_action = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
             current_landmarks = landmark_list[current_action_idx] if current_action_idx < len(landmark_list) else []
-            ssa_subtask_active = _ssa_stair_subtask_active(current_action, current_landmarks)
+            ssa_subtask_active = ssa_enabled and _ssa_stair_subtask_active(current_action, current_landmarks)
             ssa_takeover_requested = False
             ssa_takeover_direction = "unknown"
             ssa_pre_align_yaw_rad = None
@@ -783,9 +818,14 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 else:
                     next_instruction = 'Stop.'
 
-                # Filter out stuck directions from available observations
-                filtered_observe_dict = {k: v for k, v in observe_dict.items() if k not in stuck_directions}
-                filtered_images_dict = {k: v for k, v in images_dict.items() if k not in stuck_directions}
+                # Stuck filtering is part of the extended 3-step controller; keep the
+                # no-SSA path aligned with the original global multi-decision flow.
+                if ssa_enabled:
+                    filtered_observe_dict = {k: v for k, v in observe_dict.items() if k not in stuck_directions}
+                    filtered_images_dict = {k: v for k, v in images_dict.items() if k not in stuck_directions}
+                else:
+                    filtered_observe_dict = observe_dict
+                    filtered_images_dict = images_dict
 
                 if len(filtered_observe_dict) == 0:
                     nav_logger.error("All directions are stuck! Using original observations.")
@@ -794,7 +834,46 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 else:
                     nav_logger.info(f"Filtered out {len(stuck_directions)} stuck directions: {stuck_directions}")
 
-                next_vp, thought, completion_estimation, gpt_interaction = navigator.move_to_next_vp_single(nav_logger, action_list[current_action_idx], landmark_list[current_action_idx], history_traj, observation, filtered_observe_dict, filtered_images_dict, next_instruction)
+                if ssa_enabled:
+                    next_vp, thought, completion_estimation, gpt_interaction = navigator.move_to_next_vp_single(
+                        nav_logger,
+                        action_list[current_action_idx],
+                        landmark_list[current_action_idx],
+                        history_traj,
+                        observation,
+                        filtered_observe_dict,
+                        filtered_images_dict,
+                        next_instruction,
+                    )
+                else:
+                    nav_logger.info("========== Estimate Completion Progress ==========")
+                    completion_estimation = navigator.estimate_completion(nav_logger, actions, landmarks, history_traj)
+                    predictions, thoughts, completion_estimations, break_flag = navigator.move_to_next_vp(
+                        nav_logger,
+                        instruction,
+                        landmarks,
+                        history_traj,
+                        observation,
+                        filtered_observe_dict,
+                        filtered_images_dict,
+                        next_instruction=next_instruction,
+                    )
+                    nav_logger.info("========== Thought ==========")
+                    fused_pred_thought = navigator.thought_fusion(nav_logger, predictions, thoughts)
+                    nav_logger.info("========== Test Decision ==========")
+                    next_vp, thought, error_number = navigator.test_decisions(
+                        nav_logger,
+                        fused_pred_thought,
+                        observation,
+                        instruction,
+                        error_number,
+                        filtered_observe_dict,
+                    )
+                    gpt_interaction = {
+                        "mode": "original_global_navigation",
+                        "completion_estimation": completion_estimation,
+                        "completion_estimations": completion_estimations,
+                    }
                 next_vp = _resolve_valid_viewpoint(
                     next_vp,
                     filtered_observe_dict,
@@ -817,7 +896,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     _ssa_view_yaw_deg(radius_dict[next_vp]) if next_vp in radius_dict else 0.0
                 )
                 selected_ssa_view = filtered_images_dict.get(next_vp)
-                if selected_ssa_view is None:
+                if not ssa_enabled:
+                    ssa_proposal = {"available": False, "reason": "disabled"}
+                elif selected_ssa_view is None:
                     ssa_proposal = {
                         "available": False,
                         "reason": "missing_selected_view",
@@ -840,38 +921,39 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
                 step_data["ssa_delegated"] = False
                 step_data["ssa_reason"] = str(ssa_proposal.get("reason", ""))
-                ssa_controller.record_step_proposal(
-                    step=current_step,
-                    available=step_data["ssa_available"],
-                    reason=step_data["ssa_reason"],
-                    viewpoint=step_data["ssa_viewpoint"],
-                    view_yaw_deg=step_data["ssa_view_yaw_deg"],
-                )
-                ssa_estimate = SSAController._compact_estimate(ssa_proposal.get("estimate"))
-                if ssa_estimate:
-                    step_data["ssa_estimate"] = ssa_estimate
-                    episode_ssa_trace["proposal_estimates"].append(
-                        {
-                            "step": current_step,
-                            "available": step_data["ssa_available"],
-                            "reason": step_data["ssa_reason"],
-                            "viewpoint": step_data["ssa_viewpoint"],
-                            "view_yaw_deg": step_data["ssa_view_yaw_deg"],
-                            "estimate": ssa_estimate,
-                        }
+                if ssa_enabled:
+                    ssa_controller.record_step_proposal(
+                        step=current_step,
+                        available=step_data["ssa_available"],
+                        reason=step_data["ssa_reason"],
+                        viewpoint=step_data["ssa_viewpoint"],
+                        view_yaw_deg=step_data["ssa_view_yaw_deg"],
                     )
-                nav_logger.info(
-                    f"[SSA] step={current_step} episode={episode_id} "
-                    f"subtask_active={step_data['ssa_subtask_active']} "
-                    f"viewpoint={step_data['ssa_viewpoint']} "
-                    f"view_yaw_deg={step_data['ssa_view_yaw_deg']:.1f} "
-                    f"available={step_data['ssa_available']} reason={step_data['ssa_reason']}"
-                )
+                    ssa_estimate = SSAController._compact_estimate(ssa_proposal.get("estimate"))
+                    if ssa_estimate:
+                        step_data["ssa_estimate"] = ssa_estimate
+                        episode_ssa_trace["proposal_estimates"].append(
+                            {
+                                "step": current_step,
+                                "available": step_data["ssa_available"],
+                                "reason": step_data["ssa_reason"],
+                                "viewpoint": step_data["ssa_viewpoint"],
+                                "view_yaw_deg": step_data["ssa_view_yaw_deg"],
+                                "estimate": ssa_estimate,
+                            }
+                        )
+                    nav_logger.info(
+                        f"[SSA] step={current_step} episode={episode_id} "
+                        f"subtask_active={step_data['ssa_subtask_active']} "
+                        f"viewpoint={step_data['ssa_viewpoint']} "
+                        f"view_yaw_deg={step_data['ssa_view_yaw_deg']:.1f} "
+                        f"available={step_data['ssa_available']} reason={step_data['ssa_reason']}"
+                    )
 
-                if step_data["ssa_available"]:
+                if ssa_enabled and step_data["ssa_available"]:
                     episode_ssa_trace["proposal_seen"] = True
                     episode_ssa_trace["available_steps"].append(current_step)
-                elif step_data["ssa_reason"]:
+                elif ssa_enabled and step_data["ssa_reason"]:
                     episode_ssa_trace["rejection_reasons"].append(
                         {
                             "step": current_step,
@@ -879,7 +961,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         }
                     )
 
-                if ssa_proposal.get("available", False):
+                if ssa_enabled and ssa_proposal.get("available", False):
                     current_stage_text = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
                     delegate_info = ssa_proposal.get("delegate", {}) if isinstance(ssa_proposal.get("delegate"), dict) else {}
                     delegate_reason = str(delegate_info.get("decision_reason", "vlm_gate"))
@@ -910,7 +992,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     nav_logger.info(
                         f"[SSA] step={current_step} episode={episode_id} delegated=yes mode=closed_loop direction={ssa_takeover_direction}"
                     )
-                else:
+                elif ssa_enabled:
                     current_stage_text = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
                     delegate_info = ssa_proposal.get("delegate", {}) if isinstance(ssa_proposal.get("delegate"), dict) else {}
                     if delegate_info:
@@ -980,7 +1062,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 nav_logger.info(f"Completion estimation result: '{completion_estimation}'")
                 step_data["estimation_result"] = completion_estimation
 
-                if completion_estimation == "Yes":
+                if ssa_enabled and completion_estimation == "Yes":
                     nav_logger.info("========== Navigation Decision Agent ==========")
                     
                     # Import the decision agent
@@ -1093,11 +1175,11 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         nav_logger.info("Agent determined navigation should stop")
                         stop_flag = True
 
-                elif completion_estimation == "No":
+                elif ssa_enabled and completion_estimation == "No":
                     nav_logger.info("Instruction not yet completed - continuing with current instruction")
                     nav_logger.info("Skipping decision agent visualization - continuing with standard navigation")
 
-                else:
+                elif ssa_enabled:
                     nav_logger.error(f"Unexpected estimation result: {completion_estimation}")
 
             try:
@@ -1219,8 +1301,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                                 new_positions = ob.pop('positions')
                                 new_collisions = ob.pop('collisions')
 
-                                # Check if stuck: compare current position with previous position
-                                if previous_position is not None and len(new_positions) > 0:
+                                # The extended stuck-recovery feedback changes the next LLM
+                                # history. Keep it out of the no-SSA path.
+                                if ssa_enabled and previous_position is not None and len(new_positions) > 0:
                                     current_position = new_positions[-1]
                                     position_diff = np.linalg.norm(np.array(current_position) - np.array(previous_position))
 
@@ -1254,7 +1337,6 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                                     # Update previous position
                                     previous_position = current_position
                                 elif len(new_positions) > 0:
-                                    # First movement, just record position
                                     previous_position = new_positions[-1]
 
                                 envs.call_at(j,

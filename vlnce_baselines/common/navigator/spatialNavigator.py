@@ -73,7 +73,7 @@ class Open_Nav():
     # =================================
     # ===== Move to next position =====
     # =================================
-    def move_to_next_vp(self, logger, instruction, landmarks, history_traj, observation, observe_dict, images=None):    
+    def move_to_next_vp(self, logger, instruction, landmarks, history_traj, observation, observe_dict, images=None, next_instruction="Stop."):
         break_flag = True
         for i in range(2): # retry twice
             effective_prediction, thought_list, completion_estimations = [], [], []
@@ -83,7 +83,7 @@ class Open_Nav():
             #                                       num_output=3)
             batch_responses = self.llm.gpt_infer_with_images(MAPGPT_NAVIGATOR['system'], 
                                                              MAPGPT_NAVIGATOR['user'].format(observe_dict.keys(), instruction, 
-                                                                                             landmarks, history_traj, observation), 
+                                                                                             landmarks, history_traj, next_instruction, observation),
                                                              images=images,
                                                              num_output=2)
             for decision_reasoning in batch_responses:
