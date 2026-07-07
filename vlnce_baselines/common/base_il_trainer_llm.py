@@ -537,6 +537,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             detector_model_source=getattr(config, "SSA_DETECTOR_MODEL_SOURCE", None),
             filter_behind=getattr(config, "SSA_FILTER_BEHIND", False),
             oracle_exit_enabled=getattr(config, "SSA_ORACLE_EXIT_ENABLE", False),
+            max_takeovers_per_episode=int(getattr(config, "SSA_MAX_TAKEOVERS_PER_EPISODE", 1)),
         )
         current_step = 0
         current_action_idx = 0
@@ -881,7 +882,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 if ssa_proposal.get("available", False):
                     current_stage_text = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
                     delegate_info = ssa_proposal.get("delegate", {}) if isinstance(ssa_proposal.get("delegate"), dict) else {}
-                    delegate_reason = "vlm_fallback" if ssa_proposal.get("reason") == "delegate_vlm" else "rule_and_dino_gate"
+                    delegate_reason = str(delegate_info.get("decision_reason", "vlm_gate"))
                     ssa_takeover_requested = True
                     ssa_takeover_direction = str(ssa_proposal.get("direction", "unknown"))
                     ssa_pre_align_yaw_rad = radius_dict[next_vp] if next_vp in radius_dict else None
@@ -909,6 +910,21 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     nav_logger.info(
                         f"[SSA] step={current_step} episode={episode_id} delegated=yes mode=closed_loop direction={ssa_takeover_direction}"
                     )
+                else:
+                    current_stage_text = action_list[current_action_idx] if current_action_idx < len(action_list) else ""
+                    delegate_info = ssa_proposal.get("delegate", {}) if isinstance(ssa_proposal.get("delegate"), dict) else {}
+                    if delegate_info:
+                        ssa_controller.record_delegate_decision(
+                            step=current_step,
+                            delegated=False,
+                            current_stage=current_stage_text,
+                            history=history_traj,
+                            observation_hint=filtered_observe_dict.get(next_vp, ""),
+                            prompt_has_rgb=bool(delegate_info.get("prompt_has_rgb", False)),
+                            raw_response=str(delegate_info.get("raw_response", "")),
+                            reason=str(delegate_info.get("decision_reason", step_data["ssa_reason"])),
+                            direction=str(delegate_info.get("direction", "unknown")),
+                        )
 
                 # Add step data to episode info
                 episode_info["steps"].append(step_data)
