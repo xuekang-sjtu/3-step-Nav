@@ -543,6 +543,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             detector_model_source=getattr(config, "SSA_DETECTOR_MODEL_SOURCE", None),
             filter_behind=getattr(config, "SSA_FILTER_BEHIND", False),
             oracle_exit_enabled=getattr(config, "SSA_ORACLE_EXIT_ENABLE", False),
+            oracle_entry_gate_enabled=getattr(config, "SSA_ORACLE_ENTRY_GATE_ENABLE", True),
+            oracle_entry_radius_m=getattr(config, "SSA_ORACLE_ENTRY_RADIUS", 1.5),
             max_takeovers_per_episode=int(getattr(config, "SSA_MAX_TAKEOVERS_PER_EPISODE", 1)),
         )
         ssa_enabled = bool(getattr(ssa_controller, "enabled", False))
@@ -940,6 +942,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         delegate_current_stage=current_action,
                         delegate_history=history_traj,
                         delegate_observation_hint=filtered_observe_dict.get(next_vp, ""),
+                        current_position=envs.call_at(0, "get_agent_info", {}).get("position"),
+                        oracle_episode=current_episodes[0],
                     )
                 step_data["ssa_available"] = bool(ssa_proposal.get("available", False))
                 step_data["ssa_delegated"] = False
@@ -1230,6 +1234,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                                 current_position=envs.call_at(0, "get_agent_info", {}).get("position"),
                                 direction=ssa_takeover_direction,
                             ),
+                            expert_entry_pose=ssa_proposal.get("_oracle_segment") if getattr(config, "SSA_EXPERT_ENTRY_POSE", False) else None,
                         )
                         nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
                         episode_ssa_trace["takeover_success"] = bool(takeover.success)
