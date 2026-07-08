@@ -74,6 +74,8 @@ from shared.eval_metrics import format_episode_metric
 from shared.ssa import SSAController, execute_ssa_takeover
 from shared.ssa.oracle import select_oracle_exit_for_episode
 from shared.ssa.trajectory import save_trajectory_debug
+from shared.navigation import select_executable_candidate
+from shared.visualization import EpisodeGifRecorder
 
 
 def _ssa_front_view(images_dict):
@@ -154,12 +156,12 @@ def image_to_base64(image_array):
     return None
 
 
-def _save_episode_rgb_gif(gif_dir, episode_id, frames, nav_logger):
+def _save_episode_rgb_gif(gif_dir, episode_id, frames, nav_logger, max_width=640, duration=0.4):
     if not frames:
         return
-    os.makedirs(gif_dir, exist_ok=True)
-    output_path = os.path.join(gif_dir, f"{episode_id}.gif")
-    imageio.mimsave(output_path, frames, duration=0.8)
+    recorder = EpisodeGifRecorder(gif_dir, enabled=True, max_width=max_width, duration=duration, annotate=False)
+    recorder.extend_frames(frames)
+    output_path = recorder.save(episode_id)
     nav_logger.info(f"Saved RGB GIF for episode {episode_id} to {output_path}")
 
 
@@ -461,10 +463,14 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         ) 
 
         stats_episodes = {}
+        save_episode_gif = bool(getattr(config, "SAVE_EPISODE_GIF", True))
+        gif_max_width = int(getattr(config, "EPISODE_GIF_MAX_WIDTH", 640))
+        gif_duration = float(getattr(config, "EPISODE_GIF_DURATION", 0.4))
         high_rgb_gif_dir = os.path.join(config.RESULTS_DIR, "rgb_gifs_high")
-        low_rgb_gif_dir = os.path.join(config.RESULTS_DIR, "rgb_gifs_low")
-        os.makedirs(high_rgb_gif_dir, exist_ok=True)
-        os.makedirs(low_rgb_gif_dir, exist_ok=True)
+        low_rgb_gif_dir = os.path.join(config.RESULTS_DIR, "episode_gifs")
+        if save_episode_gif:
+            os.makedirs(high_rgb_gif_dir, exist_ok=True)
+            os.makedirs(low_rgb_gif_dir, exist_ok=True)
 
         if config.EVAL.EPISODE_COUNT == -1:
             episodes_to_eval = sum(envs.number_of_episodes)
@@ -874,12 +880,29 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         "completion_estimation": completion_estimation,
                         "completion_estimations": completion_estimations,
                     }
-                next_vp = _resolve_valid_viewpoint(
+                requested_vp = next_vp
+                next_vp, remapped = select_executable_candidate(
                     next_vp,
-                    filtered_observe_dict,
-                    nav_logger,
-                    context="3-step viewpoint selection",
+                    radius=radius_dict,
+                    distance=distance_dict,
+                    observations=filtered_observe_dict,
                 )
+                if next_vp is None:
+                    nav_logger.warning(
+                        "No executable waypoint candidate remains after filtering; stopping episode to avoid invalid Habitat action"
+                    )
+                    stop_flag = True
+                    dones[0] = True
+                    next_vp = _resolve_valid_viewpoint(
+                        requested_vp,
+                        filtered_observe_dict,
+                        nav_logger,
+                        context="3-step viewpoint selection",
+                    )
+                elif remapped:
+                    nav_logger.warning(
+                        f"Predicted viewpoint {requested_vp} is not executable; fallback to viewpoint {next_vp}"
+                    )
 
                 # Track the chosen viewpoint
                 last_chosen_vp = next_vp
@@ -1358,8 +1381,9 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     
                     ep_id = str(envs.current_episodes()[i].episode_id)
                     high_gif_frames = [np.asarray(img).astype(np.uint8) for img in chosen_images]
-                    _save_episode_rgb_gif(high_rgb_gif_dir, ep_id, high_gif_frames, nav_logger)
-                    _save_episode_rgb_gif(low_rgb_gif_dir, ep_id, list(low_level_rgb_frames), nav_logger)
+                    if save_episode_gif:
+                        _save_episode_rgb_gif(high_rgb_gif_dir, ep_id, high_gif_frames, nav_logger, gif_max_width, gif_duration)
+                        _save_episode_rgb_gif(low_rgb_gif_dir, ep_id, list(low_level_rgb_frames), nav_logger, gif_max_width, gif_duration)
 
                     current_step = 0
                     current_action_idx = 0
