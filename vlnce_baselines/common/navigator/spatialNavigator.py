@@ -3,11 +3,27 @@ import random
 from vlnce_baselines.common.navigator.api import *
 from vlnce_baselines.common.navigator.prompts import *
 
+def _is_timeout_error(error):
+    text = f"{type(error).__name__}: {error}".lower()
+    return "timeout" in text or "timed out" in text
+
+
 class Open_Nav():
     def __init__(self, device, llm_type, api_key):
         self.device = device
         self.llm = llmClient(llm_type, api_key)
         self.spatial = spatialClient(self.device)
+        self.reset_diagnostics()
+
+    def reset_diagnostics(self):
+        self.vlm_timeouts = 0
+        self.vlm_parse_errors = 0
+
+    def diagnostics(self):
+        return {
+            "vlm_timeouts": int(self.vlm_timeouts),
+            "vlm_parse_errors": int(self.vlm_parse_errors),
+        }
         
     # =====================================
     # ===== Instruction Comprehension =====
@@ -153,6 +169,7 @@ class Open_Nav():
 
             decision_reasoning = decision_reasoning.replace("**", "")
             if "Prediction:" not in decision_reasoning:
+                self.vlm_parse_errors += 1
                 next_vp, observe_description = random.choice(list(observe_dict.items()))
                 logger.warning(f"Random choice a next predicted action {next_vp}")
                 gpt_interaction['metadata']['random_fallback'] = True
@@ -190,6 +207,8 @@ class Open_Nav():
             digit_match = re.search(r'\d+', pred_vp)
             if digit_match:
                 pred_vp = digit_match.group()
+            else:
+                self.vlm_parse_errors += 1
 
         return pred_vp, pred_thought, completion_est, gpt_interaction
     
@@ -236,6 +255,10 @@ class Open_Nav():
             return next_vp, fused_pred_thought[next_vp], error_number
         except Exception as e:
             logger.info(f"Error in test decision {e}")
+            if _is_timeout_error(e):
+                self.vlm_timeouts += 1
+            else:
+                self.vlm_parse_errors += 1
             error_number += 1
             logger.info(f"Error number is {error_number}")
             

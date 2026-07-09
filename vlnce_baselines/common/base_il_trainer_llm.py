@@ -22,6 +22,7 @@ from openai import OpenAI
 import cv2
 import base64
 import io
+import numpy as np
 
 # for navigator      
 from vlnce_baselines.common.navigator.spatialNavigator import *
@@ -72,7 +73,7 @@ from ..models.utils import (
 )
 from shared.eval_metrics import format_episode_metric
 from shared.ssa import SSAController, execute_ssa_takeover
-from shared.ssa.oracle import select_oracle_exit_for_episode
+from shared.ssa.oracle import proposal_oracle_segment
 from shared.ssa.trajectory import save_trajectory_debug
 from shared.navigation import select_executable_candidate
 from shared.visualization import EpisodeGifRecorder
@@ -1213,28 +1214,49 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                 if not stop_flag:
                     ssa_takeover_finished_episode = False
                     if ssa_takeover_requested:
+                        def _ssa_restore_instruction(observation_item):
+                            if isinstance(observation_item, (list, tuple)) and observation_item:
+                                observation_item = observation_item[-1]
+                            if isinstance(observation_item, dict):
+                                restored = dict(observation_item)
+                                inst = restored.get("instruction")
+                                if isinstance(inst, dict):
+                                    if "text" not in inst:
+                                        restored["instruction"] = {**inst, "text": instruction}
+                                else:
+                                    restored["instruction"] = {"text": instruction}
+                                    if inst is not None:
+                                        restored["instruction"]["tokens"] = inst
+                                return restored
+                            return observation_item
+
                         def _ssa_get_forward_view(observation_item):
+                            observation_item = _ssa_restore_instruction(observation_item)
                             _, ssa_images = self.generate_input(observation_item)
                             ssa_front = ssa_images.get("0") if isinstance(ssa_images, dict) else None
                             if ssa_front is None:
                                 raise RuntimeError("SSA takeover requires a forward RGB-D view")
                             return np.asarray(ssa_front["rgb"]), np.asarray(ssa_front["depth"])
 
+                        ssa_segment = proposal_oracle_segment(
+                            ssa_proposal,
+                            required=(
+                                bool(getattr(config, "SSA_EXPERT_ENTRY_POSE", False))
+                                or bool(getattr(config, "SSA_ORACLE_EXIT_ENABLE", False))
+                            ),
+                            context="3-step-Nav",
+                        )
                         takeover = execute_ssa_takeover(
                             envs,
                             env_index=0,
                             controller=ssa_controller,
-                            initial_observation=observations[-1],
+                            initial_observation=_ssa_restore_instruction(observations[-1]),
                             get_forward_view=_ssa_get_forward_view,
                             direction=ssa_takeover_direction,
                             step=current_step,
                             pre_align_yaw_rad=ssa_pre_align_yaw_rad,
-                            oracle_exit=select_oracle_exit_for_episode(
-                                current_episodes[0],
-                                current_position=envs.call_at(0, "get_agent_info", {}).get("position"),
-                                direction=ssa_takeover_direction,
-                            ),
-                            expert_entry_pose=ssa_proposal.get("_oracle_segment") if getattr(config, "SSA_EXPERT_ENTRY_POSE", False) else None,
+                            oracle_exit=ssa_segment if getattr(config, "SSA_ORACLE_EXIT_ENABLE", False) else None,
+                            expert_entry_pose=ssa_segment if getattr(config, "SSA_EXPERT_ENTRY_POSE", False) else None,
                         )
                         nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
                         episode_ssa_trace["takeover_success"] = bool(takeover.success)
@@ -1250,6 +1272,12 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                         observations = takeover.observations
                         dones = takeover.dones
                         infos = takeover.infos
+                        env_actions_history.clear()
+                        stuck_directions.clear()
+                        last_chosen_vp = None
+                        agent_info = envs.call_at(0, "get_agent_info", {})
+                        previous_position = list(agent_info["position"])
+                        observations = [_ssa_restore_instruction(ob) for ob in observations]
                         low_level_rgb_frames.extend(
                             [np.asarray(frame).astype(np.uint8).copy() for frame in takeover.rgb_frames]
                         )
@@ -1487,6 +1515,10 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     episode_step_input_tokens = []
                     episode_step_output_tokens = []
 
+                    nav_diag = navigator.diagnostics() if hasattr(navigator, "diagnostics") else {}
+                    metric["vlm_timeouts"] = int(nav_diag.get("vlm_timeouts", 0) or 0)
+                    metric["vlm_parse_errors"] = int(nav_diag.get("vlm_parse_errors", 0) or 0)
+
                     stats_episodes[current_episodes[i].episode_id] = metric
                     nav_logger.info(
                         format_episode_metric(
@@ -1530,6 +1562,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             "ssa_trace": ssa_trace,
                         },
                     )
+                    if hasattr(navigator, "reset_diagnostics"):
+                        navigator.reset_diagnostics()
 
                     observations[i] = envs.reset_at(i)[0]
                     instruction, images_list = self.generate_input(observations[i])
