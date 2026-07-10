@@ -931,7 +931,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                     }
                 else:
                     ssa_proposal = ssa_controller.update_proposal(
-                        instruction="",
+                        instruction=instruction,
                         previous_output=current_action,
                         previous_plan=" ".join(str(item) for item in current_landmarks if item),
                         rgb=np.asarray(selected_ssa_view["rgb"]),
@@ -1257,6 +1257,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             pre_align_yaw_rad=ssa_pre_align_yaw_rad,
                             oracle_exit=ssa_segment if getattr(config, "SSA_ORACLE_EXIT_ENABLE", False) else None,
                             expert_entry_pose=ssa_segment if getattr(config, "SSA_EXPERT_ENTRY_POSE", False) else None,
+                            env_turn_degrees=float(config.TASK_CONFIG.SIMULATOR.TURN_ANGLE),
                         )
                         nav_logger.info(f"[SSA] takeover finished | success={takeover.success} reason={takeover.reason} actions={takeover.actions_executed}")
                         episode_ssa_trace["takeover_success"] = bool(takeover.success)
@@ -1289,10 +1290,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                                 current_step,
                                 {"0": final_ssa_view},
                             )
-                            ssa_thought = (
-                                f"SSA takeover executed {takeover.actions_executed} waypoint steps; "
-                                f"result={takeover.reason}."
-                            )
+                            ssa_thought = ssa_controller.latest_handoff_text()
                             nav_logger.info("========== save SSA history ==========")
                             nav_history = navigator.save_history(
                                 nav_logger,
