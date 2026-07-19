@@ -773,6 +773,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             )
 
             stop_flag = False
+            backtrack_flag = False
             current_step += 1
 
             # Record step start time and reset LLM token accumulator
@@ -1188,7 +1189,36 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             
                             outputs = envs.step([reverse_action])
                             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+                            step_low_rgb = _extract_low_level_rgb(observations[-1])
+                            if step_low_rgb is not None:
+                                low_level_rgb_frames.append(step_low_rgb)
+
+                            for j, ob in enumerate(observations):
+                                new_positions = ob.pop('positions')
+                                new_collisions = ob.pop('collisions')
+                                if len(new_positions) > 0:
+                                    previous_position = new_positions[-1]
+                                envs.call_at(
+                                    j,
+                                    'change_current_path',
+                                    {
+                                        'new_path': new_positions,
+                                        'collisions': new_collisions,
+                                    },
+                                )
+
                             instruction, images_list = self.generate_input(observations[-1])
+
+                            step_latency = time.time() - step_start_time
+                            step_tokens = navigator.llm.get_step_tokens()
+                            episode_step_latencies.append(step_latency)
+                            episode_step_input_tokens.append(step_tokens['input_tokens'])
+                            episode_step_output_tokens.append(step_tokens['output_tokens'])
+                            nav_logger.info(
+                                f"Step {current_step} backtrack stats: latency={step_latency:.2f}s, "
+                                f"input_tokens={step_tokens['input_tokens']}, "
+                                f"output_tokens={step_tokens['output_tokens']}"
+                            )
                             
                             # Update history
                             if len(nav_history) > 0:
@@ -1199,6 +1229,8 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             
                             nav_logger.info("Successfully backtracked")
                             backtrack_flag = True
+                            if current_step >= step_length:
+                                dones[0] = True
                         else:
                             nav_logger.info("Cannot backtrack - no previous actions")
                     
@@ -1221,7 +1253,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
             try:
                 if not stop_flag:
                     ssa_takeover_finished_episode = False
-                    if ssa_takeover_requested:
+                    if ssa_takeover_requested and not backtrack_flag:
                         def _ssa_restore_instruction(observation_item):
                             if isinstance(observation_item, (list, tuple)) and observation_item:
                                 observation_item = observation_item[-1]
@@ -1341,7 +1373,7 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
                             continue
                         ssa_takeover_finished_episode = True
 
-                    if not ssa_takeover_finished_episode:
+                    if not backtrack_flag and not ssa_takeover_finished_episode:
                         env_actions = []
                         env_actions.append({'action':
                             {'action': 4,
@@ -1887,10 +1919,6 @@ class BaseVLNCETrainerLLM(BaseILTrainer):
         self.config.TASK_CONFIG.TASK.NDTW.SPLIT = self.config.EVAL.SPLIT
         self.config.TASK_CONFIG.TASK.SDTW.SPLIT = self.config.EVAL.SPLIT
         self.config.use_pbar = not is_slurm_batch_job()
-        if 'rxr' in self.config.BASE_TASK_CONFIG_PATH:
-            self.config.EVAL.trajectories_file = \
-                self.config.EVAL.trajectories_file[:-8] + '_w' + \
-                str(self.world_size) + '_r' + str(self.local_rank) + '.json.gz'
         
         # if choosing image
         resize_config = self.config.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES

@@ -37,18 +37,18 @@ THOUGHT_SUMMARY = {
     'user': "Given Thought Process \"{}\", Summarization:"
 }
 
-# # Estimate Completion
-# COMPLETION_ESTIMATION = {
-#     'system': "You are a completion estimation expert. Your task is to estimate the instruction have been executed or not based on navigation history and the aiming landmarks in the current instruction. \
-#                 Your answer includes two parts: \"Thought\" and \"Decision\". You need to use \"Thought\" and \"Decision\" without any other symbols. \
-#                 In the \"Thought\", you must follow procedures to analyze as detailed as possible what actions have been executed: \
-#                 (1) What given landmarks of actions have appeared in the navigation history? \
-#                 (2) Analyze the direction change at each step in the navigation history. \
-#                 (3) Estimate the current instruction based on each step in the navigation history to check their completion. \
-#                 In the \"Decision\", you must only write down 'Yes' or 'No' without other words. \
-#                 You must strictly refer original actions in the given instruction to estimate.",
-#     'user': "Given Navigation History \"{}\" and Landmarks \"[{}]\" in the instruction \"{}\", estimate the instruction have been executed or not."
-# }
+# Estimate Completion
+COMPLETION_ESTIMATION = {
+    'system': "You are a completion estimation expert. Your task is to estimate the instruction have been executed or not based on navigation history and the aiming landmarks in the current instruction. \
+                Your answer includes two parts: \"Thought\" and \"Decision\". You need to use \"Thought\" and \"Decision\" without any other symbols. \
+                In the \"Thought\", you must follow procedures to analyze as detailed as possible what actions have been executed: \
+                (1) What given landmarks of actions have appeared in the navigation history? \
+                (2) Analyze the direction change at each step in the navigation history. \
+                (3) Estimate the current instruction based on each step in the navigation history to check their completion. \
+                In the \"Decision\", you must only write down 'Yes' or 'No' without other words. \
+                You must strictly refer original actions in the given instruction to estimate.",
+    'user': "Given Navigation History \"{}\" and Landmarks \"[{}]\" in the instruction \"{}\", estimate the instruction have been executed or not."
+}
 
 # # Main Navigator
 # NAVIGATOR = {
@@ -116,20 +116,20 @@ MAPGPT_NAVIGATOR = {
             Current Environment: {} -> Thought: ... Distance: ... Prediction: ... Completion Estimation: ... "
 }
 
-# # Thought Fusion
-# THOUGHT_FUSION = {
-#     'system': "You are a thought fusion expert. Your task is to fuse given thought processes \
-#                     into one thought. You need to reserve key information related to actions, landmarks, direction changes. You should only answer fused thought without other words.",
-#     'user': "Can you help me fuse the thoughts leading to the same movement direction? The thoughts are :{}, Fused thought: "
-# }
+# Thought Fusion
+THOUGHT_FUSION = {
+    'system': "You are a thought fusion expert. Your task is to fuse given thought processes \
+                    into one thought. You need to reserve key information related to actions, landmarks, direction changes. You should only answer fused thought without other words.",
+    'user': "Can you help me fuse the thoughts leading to the same movement direction? The thoughts are :{}, Fused thought: "
+}
 
-# # Test Decision
-# DECISION_TEST = {
-#     'system': "You are a decision testing expert. Your task is to evaluate the feasibility of each movement \
-#                         prediction based on thought process and environment. Then, you will make a final decision about direction viewpoint ID without other words. \
-#                             The answer should only be a number and within the candidate list.",
-#     'user': "The candidate list: {}. Can you help me make a final decision? The Observation: {}, Navigation Instruction: {}, {}, Final Decision: "
-# }
+# Test Decision
+DECISION_TEST = {
+    'system': "You are a decision testing expert. Your task is to evaluate the feasibility of each movement \
+                        prediction based on thought process and environment. Then, you will make a final decision about direction viewpoint ID without other words. \
+                            The answer should only be a number and within the candidate list.",
+    'user': "The candidate list: {}. Can you help me make a final decision? The Observation: {}, Navigation Instruction: {}, {}, Final Decision: "
+}
 
 # Navigation Judge
 JUDGE_PROMPT = {

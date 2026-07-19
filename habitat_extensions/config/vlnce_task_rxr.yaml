@@ -55,7 +55,7 @@ DATASET:
   TYPE: RxR-VLN-CE-v1
   SPLIT: val_unseen
   ROLES: [guide]
-  LANGUAGES: [en-US, en-IN]
+  LANGUAGES: [en-US]
   DATA_PATH: ../datasets/datasets/RxR_VLNCE_v0/val_unseen/OpenNav_RXR-CE_100_bertidx.json.gz
   SCENES_DIR: ../datasets/scene_datasets/
   EPISODES_TO_LOAD: 0
